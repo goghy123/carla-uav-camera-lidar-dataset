@@ -1,14 +1,9 @@
 # ============================================================
-# UAV Camera-LiDAR Dataset Configuration
-# ============================================================
-
-
-# ============================================================
-# SIMULATION
+# UAV Camera-LiDAR Dataset Configuration - V3.2
+# CARLA target: 0.9.16
 # ============================================================
 
 simulation:
-
   random_seed: 42
 
 
@@ -16,42 +11,20 @@ simulation:
 # RECORDING
 #
 # fps:
-#
-# 全局唯一数据采集频率。
-#
-# 同时控制：
-#
-#   CARLA simulation frequency
-#   Camera frequency
-#   LiDAR rotation frequency
-#   Dataset sampling frequency
-#
-# 当前统一：
-#
-#   10 Hz
-#
+#   Global single sampling rate for:
+#     - CARLA fixed timestep
+#     - RGB camera
+#     - Instance segmentation camera
+#     - LiDAR rotation frequency
+#     - Dataset sampling
 #
 # num_frames:
-#
-#   > 0
-#       固定录制指定帧数。
-#
-#   -1
-#       自动录制到 UAV 到达路线最后一个 waypoint。
-#
-#       实际帧数根据：
-#
-#       route_length
-#       UAV speed
-#       FPS
-#
-#       自动计算。
+#   > 0 : record exactly this many frames
+#   -1  : record until the UAV reaches the final waypoint
 # ============================================================
 
 recording:
-
   fps: 10
-
   num_frames: -1
 
 
@@ -60,65 +33,30 @@ recording:
 # ============================================================
 
 traffic:
-
   enabled: true
 
-  # CARLA 地图 spawn point 数量不足时，
-  # 实际车辆数量会自动限制。
   num_vehicles: 80
+  num_pedestrians: 30
 
   tm_port: 8000
 
-  # 在开始 UAV 数据集采集之前，
-  # 先让交通车辆运行一段时间。
-  #
-  # 避免所有车辆刚 spawn 完，
-  # 还没有正常进入道路运动状态。
+  # Let vehicles/pedestrians disperse before recording.
   warmup_seconds: 5.0
+
+  # Walker AI speed range.
+  pedestrian_speed_min_mps: 1.0
+  pedestrian_speed_max_mps: 2.0
 
 
 # ============================================================
-# UAV BODY
-#
-# CARLA:
-#
-#   x = forward
-#   y = right
-#   z = up
-#
-#
-# waypoint 模式：
-#
-# 实际飞行起点为：
-#
-#   route.waypoints[0]
-#
-#
-# initial_pose:
-#
-# 当前主要用于：
-#
-#   static 模式
-#   fallback
-#
+# UAV
 # ============================================================
 
 uav:
-
-  # UAV 飞行速度
-  #
-  # 单位：
-  #
-  # m/s
-  #
-  # 当前默认：
-  #
-  # 8 m/s
+  # Default UAV flight speed.
   speed_mps: 8.0
 
-
   initial_pose:
-
     x: -60.5942
     y: 138.0428
     z: 50.0000
@@ -126,7 +64,6 @@ uav:
     pitch: 0.0
     yaw: -2.2371
     roll: 0.0
-
 
   route_file: "routes/route_01.yaml"
 
@@ -137,126 +74,197 @@ uav:
 
 sensors:
 
-
-  # ==========================================================
-  # LiDAR
-  #
-  # LiDAR 定义为 UAV 原点。
-  #
-  # LiDAR rotation_frequency 不再写在 YAML。
-  #
-  # 程序自动：
-  #
-  # rotation_frequency = recording.fps
-  #
-  # 当前：
-  #
-  # 10 Hz
-  #
-  # 因此一个 CARLA tick 对应一圈 LiDAR。
-  # ==========================================================
-
   lidar:
-
     position:
-
       x: 0.0
       y: 0.0
       z: 0.0
 
-
     rotation:
-
       pitch: 0.0
       yaw: 0.0
       roll: 0.0
 
-
-    channels: 64
-
+    channels: 128
     range: 120.0
-
     points_per_second: 600000
 
+    # rotation_frequency is intentionally not configured here.
+    # collect_uav_v3.py forces:
+    #
+    #   rotation_frequency = recording.fps = 10 Hz
+    #
     horizontal_fov: 360.0
 
-
-    # --------------------------------------------------------
-    # Downward LiDAR
-    #
-    # -89°:
-    # 几乎垂直向下
-    #
-    # -45°:
-    # 扫描外围
-    #
-    # 最终形成向下的圆锥形扫描区域。
-    # --------------------------------------------------------
-
     upper_fov: -45.0
-
     lower_fov: -89.0
 
 
-  # ==========================================================
-  # RGB CAMERA
-  # ==========================================================
-
   camera:
-
-    # --------------------------------------------------------
-    # Camera relative position
-    #
-    # LiDAR:
-    #
-    # y = 0.00
-    #
-    # Camera:
-    #
-    # y = 0.10
-    #
-    # Camera-LiDAR baseline:
-    #
-    # 0.10 m
-    # --------------------------------------------------------
-
+    # Camera is 10 cm to the right of LiDAR.
     position:
-
       x: 0.0
       y: 0.10
       z: 0.0
 
-
-    # --------------------------------------------------------
-    # Camera orientation
-    #
-    # 当前：
-    #
-    # UAV 前向 + 向下 45°
-    # --------------------------------------------------------
-
+    # Camera points straight downward (nadir view).
     rotation:
-
-      pitch: -45.0
+      pitch: -90.0
       yaw: 0.0
       roll: 0.0
 
-
-    # --------------------------------------------------------
-    # 如果需要正下视 Camera：
-    #
-    # rotation:
-    #   pitch: -90.0
-    #   yaw: 0.0
-    #   roll: 0.0
-    # --------------------------------------------------------
-
-
     width: 1280
-
     height: 720
-
     fov: 90.0
+
+
+# ============================================================
+# ANNOTATIONS
+#
+# Dataset classes:
+#   car / van / truck / bus / motorcycle / bicycle / pedestrian
+#
+# CARLA semantic segmentation itself groups van into Car.
+# v3.2 separates dynamic vans using the vehicle blueprint base_type.
+# v3.2 filters annotations by LiDAR range + angular FOV and also
+# includes static map vehicle EnvironmentObjects.
+# ============================================================
+
+annotations:
+  enabled: true
+
+  classes:
+    - car
+    - van
+    - truck
+    - bus
+    - motorcycle
+    - bicycle
+    - pedestrian
+
+  # Optional annotation distance cap.
+  # The actual v3.2 LiDAR keep/reject test uses:
+  #   min(this value, sensors.lidar.range)
+  max_distance_m: 120.0
+
+
+  # ----------------------------------------------------------
+  # Static Map Vehicle Objects
+  #
+  # Dynamic traffic actors alone do NOT include parked/static
+  # cars that are part of the Town level geometry.
+  #
+  # v3.2 loads these once with World.get_environment_objects()
+  # and sends them through the same LiDAR FOV filter and bbox
+  # coordinate conversions as dynamic actors.
+  #
+  # CARLA has no separate CityObjectLabel.Van; static vans
+  # tagged as Car are therefore stored as dataset class "car".
+  #
+  # Visible 2D instance boxes are unavailable for static map
+  # EnvironmentObjects because they do not use the dynamic
+  # ActorID mapping. Projected 2D bbox + projected 3D cuboid
+  # are still saved.
+  # ----------------------------------------------------------
+
+  static_environment:
+    enabled: true
+
+    classes:
+      - car
+      - truck
+      - bus
+      - motorcycle
+      - bicycle
+
+
+  # ----------------------------------------------------------
+  # LiDAR FOV Filter
+  #
+  # An actor is saved only if part of its oriented 3D bbox lies
+  # inside the LiDAR detection volume:
+  #   - effective range
+  #   - horizontal_fov
+  #   - lower_fov .. upper_fov
+  #
+  # No occlusion test is performed.
+  # num_lidar_points is diagnostic only and is NOT used to
+  # decide whether an object is saved.
+  #
+  # The bbox volume is sampled on an N x N x N grid.
+  # 5 -> 125 test points/object and is a good robust default.
+  # ----------------------------------------------------------
+
+  lidar_fov_filter:
+    enabled: true
+    bbox_samples_per_axis: 5
+
+
+  # ----------------------------------------------------------
+  # 3D Bounding Boxes
+  #
+  # world:
+  #   CARLA world coordinates
+  #
+  # lidar:
+  #   LiDAR local CARLA/UE coordinates
+  #
+  # camera_ue:
+  #   camera local CARLA/UE coordinates
+  #
+  # camera_cv:
+  #   OpenCV camera coordinates
+  #   x right, y down, z forward
+  # ----------------------------------------------------------
+
+  bbox3d:
+    enabled: true
+
+    save_world: true
+    save_lidar: true
+    save_camera: true
+
+    # Count current raw LiDAR points geometrically inside
+    # every actor's oriented 3D bounding box.
+    count_lidar_points: true
+
+
+  # ----------------------------------------------------------
+  # 2D Bounding Boxes
+  #
+  # projected:
+  #   geometry projection of the 3D cuboid.
+  #
+  # visible:
+  #   actual visible pixels from CARLA instance segmentation.
+  #
+  # Instance segmentation is used only in memory and is not saved.
+  # ----------------------------------------------------------
+
+  bbox2d:
+    enabled: true
+
+    projected: true
+    visible: true
+
+    min_visible_pixels: 5
+
+    # 3D cuboid clipping plane in OpenCV camera coordinates.
+    near_clip_m: 0.05
+
+
+  # ----------------------------------------------------------
+  # Debug images
+  #
+  # rgb/ stays clean.
+  #
+  # debug_bbox/ contains:
+  #   blue  = projected 3D envelope
+  #   green = actually visible instance bbox
+  # ----------------------------------------------------------
+
+  visualization:
+    save_debug_images: true
 
 
 # ============================================================
@@ -264,11 +272,9 @@ sensors:
 # ============================================================
 
 output:
-
   root: dataset
 
   save_rgb: true
-
   save_lidar: true
-
   save_pose: true
+  save_labels: true
