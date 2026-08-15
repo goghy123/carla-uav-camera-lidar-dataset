@@ -1,0 +1,30 @@
+# ============================================================
+# Static UAV Route
+#
+# UAV 固定在 UAVdataset.yaml 的 initial_pose，不移动。
+# 用来测试 Camera / LiDAR / Calibration。
+# ============================================================
+
+route:
+
+  name: "static_test"
+
+  mode: waypoints
+
+  speed_mps: 0.0
+
+  loop: false
+
+  waypoints:
+    - x: -60.594
+      y: 138.043
+      z: 55.0
+    - x: -50.764
+      y: 21.184
+      z: 34.489
+    - x: 54.105
+      y: -59.182
+      z: 56.784
+    - x: 102.64
+      y: 28.542
+      z: 62.019
