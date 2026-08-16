@@ -18,23 +18,18 @@ except ImportError:
     cv2 = None
 
 
-# ============================================================
-# PATH
-# ============================================================
+########################## 路径：定义项目根目录和配置文件位置 ################################
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "configs" / "UAVdataset.yaml"
 
 
-# ============================================================
-# CONSTANTS
-# ============================================================
+########################## 常量：定义类别编号、坐标关系和固定参数 ################################
 
-# CARLA 0.9.16 semantic tags.
 CLASS_TO_SEMANTIC_TAG = {
     "pedestrian": 12,
     "car": 14,
-    "van": 14,          # CARLA semantic layer groups vans with Car.
+    "van": 14,
     "truck": 15,
     "bus": 16,
     "motorcycle": 18,
@@ -44,9 +39,6 @@ CLASS_TO_SEMANTIC_TAG = {
 
 SUPPORTED_CLASSES = set(CLASS_TO_SEMANTIC_TAG.keys())
 
-# Static level geometry available through World.get_environment_objects().
-# CARLA's map semantic layer does not expose a separate Van label; parked
-# vans tagged as Car will therefore be stored as dataset class "car".
 STATIC_ENV_CLASS_TO_CITY_LABEL = {
     "car": carla.CityObjectLabel.Car,
     "truck": carla.CityObjectLabel.Truck,
@@ -55,17 +47,12 @@ STATIC_ENV_CLASS_TO_CITY_LABEL = {
     "bicycle": carla.CityObjectLabel.Bicycle,
 }
 
-# CARLA BoundingBox vertex connectivity.
 BBOX_EDGES = [
     (0, 1), (1, 3), (3, 2), (2, 0),
     (0, 4), (4, 5), (5, 1), (5, 7),
     (7, 6), (6, 4), (6, 2), (7, 3),
 ]
 
-# CARLA camera local UE coordinates:
-#   x forward, y right, z up
-# OpenCV camera coordinates:
-#   x right, y down, z forward
 T_CV_UE = np.array(
     [
         [0.0, 1.0,  0.0, 0.0],
@@ -77,9 +64,7 @@ T_CV_UE = np.array(
 )
 
 
-# ============================================================
-# YAML
-# ============================================================
+########################## 配置读取：加载 YAML 配置并转换为程序数据 ################################
 
 def load_yaml(path):
     yaml = YAML()
@@ -230,9 +215,7 @@ def validate_config(config):
             )
 
 
-# ============================================================
-# TRANSFORM / MATRIX
-# ============================================================
+########################## 坐标变换：在 CARLA、LiDAR 和相机坐标系之间转换 ################################
 
 def pose_dict(transform):
     return {
@@ -292,8 +275,6 @@ def matrix_to_carla_rotation(transform_matrix):
         yaw = math.atan2(r[1, 0], r[0, 0])
         roll = math.atan2(-r[2, 1], r[2, 2])
     else:
-        # Gimbal-lock fallback. Orientation matrix is also saved, so no
-        # information is lost even in this rare case.
         yaw = math.atan2(-r[0, 1], r[1, 1])
         roll = 0.0
 
@@ -335,9 +316,7 @@ def sensor_world_transform(
     return carla.Transform(world_location, world_rotation)
 
 
-# ============================================================
-# CAMERA INTRINSIC
-# ============================================================
+########################## 相机内参：根据图像尺寸和视场角计算投影参数 ################################
 
 def camera_intrinsic(width, height, fov):
     focal = width / (
@@ -354,9 +333,7 @@ def camera_intrinsic(width, height, fov):
     )
 
 
-# ============================================================
-# SENSOR QUEUE
-# ============================================================
+########################## 传感器队列：按帧号配对相机与 LiDAR 数据 ################################
 
 def get_frame(sensor_queue, target_frame, name, timeout=10.0):
     deadline = time.monotonic() + timeout
@@ -388,9 +365,7 @@ def get_frame(sensor_queue, target_frame, name, timeout=10.0):
         )
 
 
-# ============================================================
-# UAV ROUTE
-# ============================================================
+########################## UAV 路线：读取航点并计算无人机的移动目标 ################################
 
 class UAVRoute:
 
@@ -586,9 +561,7 @@ class UAVRoute:
         )
 
 
-# ============================================================
-# RECORDING PLAN
-# ============================================================
+########################## 录制计划：决定录制帧数和结束条件 ################################
 
 def determine_recording_frames(route, configured_num_frames):
     configured_num_frames = int(configured_num_frames)
@@ -752,9 +725,7 @@ def print_recording_plan(
     print()
 
 
-# ============================================================
-# ACTOR CLASSIFICATION
-# ============================================================
+########################## 对象分类：把 CARLA 对象映射为数据集类别 ################################
 
 def blueprint_base_type(blueprint):
     if blueprint.has_attribute("base_type"):
@@ -782,7 +753,6 @@ def classify_actor(actor):
         ):
             return base_type
 
-        # Fallback to semantic tags.
         semantic_tags = set(int(x) for x in actor.semantic_tags)
 
         if 15 in semantic_tags:
@@ -799,9 +769,7 @@ def classify_actor(actor):
     return None
 
 
-# ============================================================
-# STATIC MAP ENVIRONMENT OBJECTS
-# ============================================================
+########################## 静态地图对象：读取场景中不移动的车辆等对象 ################################
 
 def collect_static_environment_objects(
     world,
@@ -923,9 +891,7 @@ def collect_static_environment_objects(
     return result
 
 
-# ============================================================
-# TRAFFIC
-# ============================================================
+########################## 交通：生成和管理车辆、行人及其控制器 ################################
 
 def spawn_traffic(
     client,
@@ -960,8 +926,6 @@ def spawn_traffic(
     for bp in all_vehicle_bps:
         base_type = blueprint_base_type(bp)
 
-        # If base_type is unavailable, retain the blueprint and classify
-        # after spawning. CARLA 0.9.16 vehicle catalogue normally exposes it.
         if not base_type or base_type in allowed_vehicle_classes:
             vehicle_bps.append(bp)
 
@@ -1052,7 +1016,6 @@ def spawn_pedestrians(
 
     rng = random.Random(int(random_seed) + 100003)
 
-    # CARLA 0.9.16 exposes a deterministic pedestrian seed.
     try:
         world.set_pedestrians_seed(int(random_seed))
     except RuntimeError:
@@ -1067,7 +1030,6 @@ def spawn_pedestrians(
 
     walkers = []
 
-    # Navigation points can occasionally be unavailable or fail to spawn.
     max_attempts = max(requested * 10, 50)
     attempts = 0
 
@@ -1111,7 +1073,6 @@ def spawn_pedestrians(
         if controller is not None:
             controllers.append(controller)
 
-    # Make controller actors active before issuing AI commands.
     world.tick()
 
     speed_min = float(
@@ -1169,9 +1130,7 @@ def warmup_traffic(world, fps, warmup_seconds):
     print("Traffic warmup complete.")
 
 
-# ============================================================
-# INSTANCE SEGMENTATION
-# ============================================================
+########################## 实例分割：读取用于计算可见框的分割图 ################################
 
 def decode_instance_segmentation(instance_image):
     """
@@ -1300,9 +1259,7 @@ def visible_bbox_from_instance(
     }, None
 
 
-# ============================================================
-# 3D BBOX GEOMETRY
-# ============================================================
+########################## 三维框几何：计算目标包围盒角点和坐标 ################################
 
 def frame_bbox_dict(
     target_from_bbox,
@@ -1334,8 +1291,6 @@ def camera_cv_bbox_dict(
     size_xyz,
     corners_camera_cv,
 ):
-    # camera_cv is a handedness conversion, so a CARLA Euler angle is not
-    # meaningful here. Keep the exact transform/orientation matrix instead.
     return {
         "center_xyz_m": [
             float(v)
@@ -1366,7 +1321,6 @@ def count_lidar_points_in_bbox(
         dtype=np.float64,
     )
 
-    # Broad-phase AABB in LiDAR coordinates.
     local_corners = np.array(
         [
             [sx * extent_xyz[0], sy * extent_xyz[1], sz * extent_xyz[2]]
@@ -1415,9 +1369,7 @@ def count_lidar_points_in_bbox(
 
 
 
-# ============================================================
-# LIDAR FOV FILTER
-# ============================================================
+########################## LiDAR 视场筛选：判断目标是否在量程和视场内 ################################
 
 def make_bbox_local_grid(extent_xyz, samples_per_axis=5):
     """
@@ -1592,8 +1544,6 @@ def bbox_lidar_fov_status(
             horizontal_fov / 2.0
         )
 
-        # atan2 already returns [-180, 180]. CARLA horizontal_fov is treated
-        # as a symmetric field centered on the LiDAR +x forward axis.
         horizontal_mask = (
             np.abs(azimuth_deg)
             <= half_horizontal_fov + 1e-6
@@ -1650,9 +1600,7 @@ def bbox_lidar_fov_status(
     }
 
 
-# ============================================================
-# 2D PROJECTION
-# ============================================================
+########################## 二维投影：把三维包围盒投影到相机图像 ################################
 
 def project_cv_points(points_cv, K):
     points_cv = np.asarray(points_cv, dtype=np.float64)
@@ -1793,9 +1741,7 @@ def projected_bbox_from_corners(
     }
 
 
-# ============================================================
-# ANNOTATION
-# ============================================================
+########################## 标注：生成目标三维框、二维框和诊断信息 ################################
 
 def build_object_annotation(
     actor,
@@ -1945,7 +1891,6 @@ def build_object_annotation(
             return None, "outside_lidar_fov"
 
     else:
-        # Compatibility fallback: v3's original distance-only filter.
         if nearest_box_distance > max_distance:
             return None, "outside_annotation_distance"
 
@@ -1978,8 +1923,6 @@ def build_object_annotation(
     }
 
     if lidar_filter_enabled:
-        # Every saved object has already passed this test. Keep the exact
-        # test parameters/results in the label for auditability.
         object_data["lidar_fov"] = (
             lidar_fov_status
         )
@@ -1994,9 +1937,7 @@ def build_object_annotation(
             )
         )
 
-    # --------------------------------------------------------
-    # 3D bbox
-    # --------------------------------------------------------
+    ########################## 三维框：生成三维包围盒数据 ################################
 
     if bbox3d_cfg.get(
         "enabled",
@@ -2046,8 +1987,6 @@ def build_object_annotation(
             "count_lidar_points",
             True,
         ):
-            # Diagnostic only. num_lidar_points does NOT decide whether an
-            # object is kept in v3.2.
             object_data["num_lidar_points"] = (
                 count_lidar_points_in_bbox(
                     lidar_points_xyz,
@@ -2058,9 +1997,7 @@ def build_object_annotation(
 
         object_data["bbox3d"] = bbox3d
 
-    # --------------------------------------------------------
-    # 2D bbox
-    # --------------------------------------------------------
+    ########################## 二维框：生成图像中的目标框 ################################
 
     if bbox2d_cfg.get(
         "enabled",
@@ -2157,7 +2094,6 @@ def build_environment_object_annotation(
 
     bbox = environment_object.bounding_box
 
-    # EnvironmentObject.bounding_box location and rotation are world-space.
     world_from_bbox = matrix(
         carla.Transform(
             bbox.location,
@@ -2165,7 +2101,6 @@ def build_environment_object_annotation(
         )
     )
 
-    # Identity actor transform: bbox itself is already in world coordinates.
     corners_world = carla_locations_to_numpy(
         bbox.get_world_vertices(
             carla.Transform()
@@ -2280,7 +2215,6 @@ def build_environment_object_annotation(
     lidar_fov_status = None
 
     if lidar_filter_enabled:
-        # Fast broad-phase rejection before the denser bbox-volume sampling.
         effective_range = min(
             float(
                 lidar_cfg[
@@ -2389,9 +2323,7 @@ def build_environment_object_annotation(
             "lidar_fov"
         ] = lidar_fov_status
 
-    # --------------------------------------------------------
-    # 3D bbox
-    # --------------------------------------------------------
+    ########################## 三维框：生成三维包围盒数据 ################################
 
     if bbox3d_cfg.get(
         "enabled",
@@ -2463,9 +2395,7 @@ def build_environment_object_annotation(
             "bbox3d"
         ] = bbox3d
 
-    # --------------------------------------------------------
-    # 2D bbox
-    # --------------------------------------------------------
+    ########################## 二维框：生成图像中的目标框 ################################
 
     if bbox2d_cfg.get(
         "enabled",
@@ -2560,9 +2490,7 @@ def build_frame_annotations(
         "filtered_outside_annotation_distance": 0,
     }
 
-    # --------------------------------------------------------
-    # Dynamic actors
-    # --------------------------------------------------------
+    ########################## 动态对象：处理会移动的交通对象 ################################
 
     for actor in actors:
         if (
@@ -2652,9 +2580,7 @@ def build_frame_annotations(
                 "filtered_outside_annotation_distance"
             ] += 1
 
-    # --------------------------------------------------------
-    # Static map EnvironmentObjects
-    # --------------------------------------------------------
+    ########################## 静态地图对象：处理地图中的固定对象 ################################
 
     for item in environment_objects:
         environment_object = item[
@@ -2736,9 +2662,7 @@ def build_frame_annotations(
     return objects, stats
 
 
-# ============================================================
-# DEBUG VISUALIZATION
-# ============================================================
+########################## 调试可视化：生成检查投影结果的辅助图像 ################################
 
 def image_to_bgr(image):
     raw = np.frombuffer(
@@ -2772,7 +2696,6 @@ def draw_debug_bboxes(
         projected = bbox2d.get("projected")
         visible = bbox2d.get("visible")
 
-        # Projected 3D envelope: blue.
         if projected is not None:
             x1, y1, x2, y2 = projected["xyxy"]
 
@@ -2784,7 +2707,6 @@ def draw_debug_bboxes(
                 1,
             )
 
-        # Actually visible instance mask bbox: green.
         if visible is not None:
             x1, y1, x2, y2 = visible["xyxy"]
 
@@ -2829,9 +2751,7 @@ def draw_debug_bboxes(
     )
 
 
-# ============================================================
-# SENSOR BLUEPRINTS
-# ============================================================
+########################## 传感器蓝图：创建 RGB、分割相机和 LiDAR 参数 ################################
 
 def configure_camera_blueprint(
     bp,
@@ -2861,9 +2781,7 @@ def configure_camera_blueprint(
         bp.set_attribute("lens_kcube", "0.0")
 
 
-# ============================================================
-# MAIN
-# ============================================================
+########################## 程序入口：读取配置并启动工具 ################################
 
 def main():
     config = load_config()
@@ -2948,9 +2866,7 @@ def main():
 
     tm_sync_enabled = False
 
-    # --------------------------------------------------------
-    # Output
-    # --------------------------------------------------------
+    ########################## 输出：准备数据集目录和文件 ################################
 
     output_root = (
         PROJECT_ROOT
@@ -3042,9 +2958,7 @@ def main():
         )
 
     try:
-        # ====================================================
-        # SYNCHRONOUS MODE
-        # ====================================================
+        ########################## 同步模式：让模拟器和传感器按同一帧运行 ################################
 
         settings = world.get_settings()
         settings.synchronous_mode = True
@@ -3066,9 +2980,7 @@ def main():
             f"{FPS:.1f} Hz"
         )
 
-        # ====================================================
-        # TRAFFIC
-        # ====================================================
+        ########################## 交通：生成和管理车辆、行人及其控制器 ################################
 
         allowed_classes = set(
             ann_cfg.get(
@@ -3146,9 +3058,7 @@ def main():
                 "static environment objects"
             )
 
-        # ====================================================
-        # INITIAL UAV
-        # ====================================================
+        ########################## 初始 UAV：放置无人机并设置姿态 ################################
 
         initial_uav = route.pose_at_frame(0)
 
@@ -3166,9 +3076,7 @@ def main():
 
         bp_lib = world.get_blueprint_library()
 
-        # ====================================================
-        # RGB CAMERA
-        # ====================================================
+        ########################## RGB 相机：创建记录彩色图像的相机 ################################
 
         camera_bp = bp_lib.find(
             "sensor.camera.rgb"
@@ -3184,12 +3092,6 @@ def main():
             camera_tf,
         )
 
-        # ====================================================
-        # INSTANCE SEGMENTATION CAMERA
-        #
-        # Spawned only when visible 2D bbox is requested.
-        # Same intrinsics/extrinsics/tick as RGB.
-        # ====================================================
 
         bbox2d_cfg = ann_cfg.get(
             "bbox2d",
@@ -3225,9 +3127,7 @@ def main():
                 )
             )
 
-        # ====================================================
-        # LiDAR
-        # ====================================================
+        ########################## LiDAR：保存三维点云 ################################
 
         lidar_bp = bp_lib.find(
             "sensor.lidar.ray_cast"
@@ -3241,7 +3141,6 @@ def main():
                     "points_per_second"
                 ]
             ),
-            # Global dataset frequency.
             "rotation_frequency": FPS,
             "horizontal_fov": (
                 lidar_cfg[
@@ -3272,9 +3171,7 @@ def main():
             lidar_tf,
         )
 
-        # ====================================================
-        # QUEUES
-        # ====================================================
+        ########################## 队列：接收并暂存传感器数据 ################################
 
         camera_queue = queue.Queue()
         lidar_queue = queue.Queue()
@@ -3292,9 +3189,7 @@ def main():
                 instance_queue.put
             )
 
-        # ====================================================
-        # CALIBRATION
-        # ====================================================
+        ########################## 标定：保存传感器之间的内外参 ################################
 
         image_width = int(
             camera_cfg["width"]
@@ -3398,9 +3293,7 @@ def main():
             "m",
         )
 
-        # ====================================================
-        # METADATA
-        # ====================================================
+        ########################## 元数据：记录场景、传感器和录制设置 ################################
 
         metadata = {
             "scene_name": scene_name,
@@ -3591,9 +3484,7 @@ def main():
 
         spectator = world.get_spectator()
 
-        # ====================================================
-        # RECORD
-        # ====================================================
+        ########################## 录制：逐帧推进模拟器并写入数据集 ################################
 
         print()
         print("=" * 64)
@@ -3603,9 +3494,7 @@ def main():
         print()
 
         for i in range(NUM_FRAMES):
-            # ------------------------------------------------
-            # UAV / sensor poses
-            # ------------------------------------------------
+            ########################## UAV 和传感器姿态：记录每帧位姿 ################################
 
             uav_tf = route.pose_at_frame(i)
 
@@ -3655,9 +3544,7 @@ def main():
                 )
             )
 
-            # ------------------------------------------------
-            # Tick
-            # ------------------------------------------------
+            ########################## 模拟器步进：推进一帧并等待传感器 ################################
 
             carla_frame = world.tick()
 
@@ -3700,9 +3587,7 @@ def main():
                     f"instance={instance_image.frame}"
                 )
 
-            # ------------------------------------------------
-            # RGB
-            # ------------------------------------------------
+            ########################## RGB：保存彩色图像 ################################
 
             if SAVE_RGB:
                 image.save_to_disk(
@@ -3712,9 +3597,7 @@ def main():
                     )
                 )
 
-            # ------------------------------------------------
-            # LiDAR
-            # ------------------------------------------------
+            ########################## LiDAR：保存点云 ################################
 
             points = np.frombuffer(
                 cloud.raw_data,
@@ -3729,9 +3612,7 @@ def main():
                     )
                 )
 
-            # ------------------------------------------------
-            # 3D/2D annotations
-            # ------------------------------------------------
+            ########################## 三维和二维标注：保存目标框 ################################
 
             objects = []
             annotation_stats = {
@@ -3803,9 +3684,7 @@ def main():
                         ),
                     )
 
-            # ------------------------------------------------
-            # Pose
-            # ------------------------------------------------
+            ########################## 姿态：保存 UAV 位姿 ################################
 
             dataset_time = float(i) / FPS
 
@@ -3901,9 +3780,7 @@ def main():
                 f"{uav_tf.location.z:.1f})"
             )
 
-        # ====================================================
-        # DONE
-        # ====================================================
+        ########################## 完成：输出本次录制的结果摘要 ################################
 
         print()
         print("=" * 64)
@@ -3938,9 +3815,7 @@ def main():
             )
 
     finally:
-        # ====================================================
-        # CLEANUP
-        # ====================================================
+        ########################## 清理：停止控制器和传感器并恢复模拟器设置 ################################
 
         print("\nCleaning up...")
 
@@ -3955,7 +3830,6 @@ def main():
                 except RuntimeError:
                     pass
 
-        # Walker AI controllers must be stopped first.
         for controller in walker_controllers:
             if controller is not None:
                 try:

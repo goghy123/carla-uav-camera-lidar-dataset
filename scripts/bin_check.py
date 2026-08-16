@@ -2,13 +2,13 @@ from pathlib import Path
 import numpy as np
 from mayavi import mlab
 
-# bin_check.py 所在目录
+# 脚本所在目录；项目根目录由它的上一级目录确定。
 script_dir = Path(__file__).resolve().parent
 
-# carla_project
+# 项目根目录。
 project_dir = script_dir.parent
 
-# 点云文件
+# 要检查的 LiDAR 二进制点云文件。
 lidar_path = (
     project_dir
     / "dataset"
