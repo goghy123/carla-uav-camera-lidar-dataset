@@ -20,6 +20,13 @@ from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import QMainWindow
 
 
+# python scripts/play_uavdataset.py `
+#     --scene dataset\scene_20260816_190100 `
+#     --fps 15 `
+#     --range 80 `
+#     --max-points 0 `
+#     --prefetch 12 `
+#     --io-workers 2
 
 
 ########################## 项目设置：定义数据集目录和共享设置 ################################
@@ -151,10 +158,10 @@ def parse_args():
     parser.add_argument(
         "--min-lidar-points",
         type=int,
-        default=1,
+        default=3,
         help=(
-            "Only display objects containing at least this many "
-            "LiDAR points. Default: 1"
+            "Additional playback-only LiDAR-point threshold. The recorder "
+            "already applies its own hard retention threshold. Default: 3"
         ),
     )
 
@@ -680,6 +687,17 @@ def object_passes_filter(
     ).lower()
 
     if cls not in selected_classes:
+        return False
+
+    lidar_visibility = obj.get(
+        "visibility",
+        {},
+    ).get(
+        "lidar",
+        None,
+    )
+
+    if lidar_visibility is False:
         return False
 
     if int(
@@ -1365,12 +1383,24 @@ def build_overlays(
             {},
         )
 
+        rgb_visibility = obj.get(
+            "visibility",
+            {},
+        ).get(
+            "rgb",
+            None,
+        )
+        rgb_display_allowed = (
+            rgb_visibility is not False
+        )
+
         visible = bbox2d.get(
             "visible"
         )
 
         if (
-            visible is not None
+            rgb_display_allowed
+            and visible is not None
             and visible.get(
                 "xyxy"
             ) is not None
@@ -1395,7 +1425,8 @@ def build_overlays(
         )
 
         if (
-            projected is not None
+            rgb_display_allowed
+            and projected is not None
             and projected.get(
                 "xyxy"
             ) is not None
@@ -1435,7 +1466,10 @@ def build_overlays(
             dtype=np.float32,
         )
 
-        if corners_cv is not None:
+        if (
+            rgb_display_allowed
+            and corners_cv is not None
+        ):
             rgb_cuboid = (
                 projected_cuboid_segments(
                     corners_cv,
@@ -1488,20 +1522,24 @@ def build_overlays(
             else:
                 lidar_boxes_outside_display_range += 1
 
-        anchor = text_anchor(
-            obj,
-            rgb_cuboid,
-            width,
-            height,
-        )
+        anchor = None
+
+        if rgb_display_allowed:
+            anchor = text_anchor(
+                obj,
+                rgb_cuboid,
+                width,
+                height,
+            )
 
         if anchor is not None:
             text_lists[
                 cls
             ].append(
                 f"{cls} "
-                f"id={obj.get('actor_id', '?')} "
-                f"pts={obj.get('num_lidar_points', 0)}"
+                f"id={obj.get('actor_id', obj.get('environment_object_id', '?'))} "
+                f"pts={obj.get('num_lidar_points', 0)} "
+                f"rgbpx={obj.get('num_rgb_visible_pixels', '-')}"
             )
 
             text_positions[
@@ -3267,8 +3305,19 @@ def main():
         "LiDAR bbox intersects the current --range cube."
     )
     print(
-        "  Objects with fewer than --min-lidar-points "
-        "are not displayed; labels on disk are never modified."
+        "  Dataset labels are hard-filtered during recording by the "
+        "configured LiDAR visibility threshold."
+    )
+    print(
+        "  --min-lidar-points is an additional playback-only threshold; "
+        "it never makes an invalid recorded object valid."
+    )
+    print(
+        "  Newly recorded dynamic objects must pass both the recorder's "
+        "LiDAR-point and RGB-visible-pixel hard thresholds."
+    )
+    print(
+        "  Overlay text shows pts=<LiDAR points> and rgbpx=<visible RGB pixels>."
     )
     print(
         "  RGB point coloring uses synchronized RGB + "

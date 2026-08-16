@@ -39,6 +39,15 @@ CLASS_TO_SEMANTIC_TAG = {
 
 SUPPORTED_CLASSES = set(CLASS_TO_SEMANTIC_TAG.keys())
 
+# CARLA 的 instance segmentation 语义标签来自 Actor 实际组件标签。
+# 数据集类别（例如 van）和 CARLA 的渲染语义标签并不保证一一对应，
+# 因此动态 Actor 的实例像素匹配必须优先读取 actor.semantic_tags，
+# 不能仅依赖 CLASS_TO_SEMANTIC_TAG 的数据集类别映射。
+DYNAMIC_INSTANCE_THING_TAGS = frozenset(
+    CLASS_TO_SEMANTIC_TAG.values()
+)
+
+
 STATIC_ENV_CLASS_TO_CITY_LABEL = {
     "car": carla.CityObjectLabel.Car,
     "truck": carla.CityObjectLabel.Truck,
@@ -198,9 +207,22 @@ def validate_config(config):
             raise ValueError("annotations.max_distance_m must be > 0")
 
         bbox2d_cfg = ann_cfg.get("bbox2d", {})
-        if int(bbox2d_cfg.get("min_visible_pixels", 1)) < 1:
+
+        rgb_visibility_cfg = ann_cfg.get(
+            "rgb_visibility_filter",
+            {},
+        )
+        min_rgb_visible_pixels = int(
+            rgb_visibility_cfg.get(
+                "min_visible_pixels",
+                5,
+            )
+        )
+
+        if min_rgb_visible_pixels < 1:
             raise ValueError(
-                "annotations.bbox2d.min_visible_pixels must be >= 1"
+                "annotations.rgb_visibility_filter.min_visible_pixels "
+                "must be >= 1"
             )
 
         lidar_filter_cfg = ann_cfg.get("lidar_fov_filter", {})
@@ -212,6 +234,23 @@ def validate_config(config):
             raise ValueError(
                 "annotations.lidar_fov_filter.bbox_samples_per_axis "
                 "must be >= 3"
+            )
+
+        lidar_visibility_cfg = ann_cfg.get(
+            "lidar_visibility",
+            {},
+        )
+        min_lidar_points = int(
+            lidar_visibility_cfg.get(
+                "min_lidar_points",
+                3,
+            )
+        )
+
+        if min_lidar_points < 1:
+            raise ValueError(
+                "annotations.lidar_visibility.min_lidar_points "
+                "must be >= 1"
             )
 
 
@@ -699,9 +738,31 @@ def print_recording_plan(
         )
 
         lidar_filter_cfg = ann_cfg.get("lidar_fov_filter", {})
+        lidar_visibility_cfg = ann_cfg.get("lidar_visibility", {})
         print(
             f"LiDAR FOV filter       : "
             f"{lidar_filter_cfg.get('enabled', True)}"
+        )
+        print(
+            f"LiDAR visibility filter: "
+            f"{lidar_visibility_cfg.get('enabled', True)}"
+        )
+        print(
+            f"Min LiDAR bbox points  : "
+            f"{int(lidar_visibility_cfg.get('min_lidar_points', 3))}"
+        )
+
+        rgb_visibility_cfg = ann_cfg.get(
+            "rgb_visibility_filter",
+            {},
+        )
+        print(
+            f"RGB visibility filter  : "
+            f"{rgb_visibility_cfg.get('enabled', True)}"
+        )
+        print(
+            f"Min RGB visible pixels : "
+            f"{int(rgb_visibility_cfg.get('min_visible_pixels', 5))}"
         )
         print(
             f"LiDAR sensor range     : "
@@ -767,6 +828,44 @@ def classify_actor(actor):
             return "car"
 
     return None
+
+
+def actor_instance_semantic_tag(
+    actor,
+    actor_class,
+):
+    """
+    Resolve the semantic tag that CARLA actually renders for this dynamic
+    actor in sensor.camera.instance_segmentation.
+
+    Dataset class and rendered semantic tag are intentionally treated as
+    separate concepts. For example, an actor classified as dataset class
+    "van" by its base_type may still use a CARLA component tag associated
+    with another vehicle semantic category.
+
+    actor.semantic_tags is therefore authoritative when it contains one of
+    the supported dynamic thing tags. The static class mapping is only a
+    fallback for malformed/custom assets that expose no usable semantic tag.
+    """
+    actor_tags = []
+
+    try:
+        actor_tags = [
+            int(tag)
+            for tag in actor.semantic_tags
+        ]
+    except Exception:
+        actor_tags = []
+
+    for tag in actor_tags:
+        if tag in DYNAMIC_INSTANCE_THING_TAGS:
+            return int(tag)
+
+    return int(
+        CLASS_TO_SEMANTIC_TAG[
+            actor_class
+        ]
+    )
 
 
 ########################## 静态地图对象：读取场景中不移动的车辆等对象 ################################
@@ -1171,8 +1270,101 @@ def decode_instance_segmentation(instance_image):
 def instance_key(actor, actor_class):
     return (
         int(actor.id) & 0xFFFF,
-        CLASS_TO_SEMANTIC_TAG[actor_class],
+        actor_instance_semantic_tag(
+            actor,
+            actor_class,
+        ),
     )
+
+
+def print_dynamic_semantic_tag_audit(
+    actors,
+    allowed_classes,
+):
+    """
+    Print only semantic-tag overrides. This makes asset-specific differences
+    visible immediately without flooding the console every frame.
+    """
+    overrides = defaultdict(
+        lambda: {
+            "count": 0,
+            "actor_ids": [],
+        }
+    )
+
+    for actor in actors:
+        if actor is None or not actor.is_alive:
+            continue
+
+        actor_class = classify_actor(actor)
+
+        if actor_class not in allowed_classes:
+            continue
+
+        configured_tag = int(
+            CLASS_TO_SEMANTIC_TAG[
+                actor_class
+            ]
+        )
+        actual_tag = int(
+            actor_instance_semantic_tag(
+                actor,
+                actor_class,
+            )
+        )
+
+        if actual_tag == configured_tag:
+            continue
+
+        key = (
+            actor_class,
+            actor.type_id,
+            configured_tag,
+            actual_tag,
+        )
+
+        overrides[key]["count"] += 1
+
+        if len(
+            overrides[key]["actor_ids"]
+        ) < 5:
+            overrides[key][
+                "actor_ids"
+            ].append(
+                int(actor.id)
+            )
+
+    if not overrides:
+        print(
+            "\nDynamic semantic-tag audit: "
+            "no dataset-class/render-tag overrides detected."
+        )
+        return
+
+    print(
+        "\nDynamic semantic-tag audit:"
+    )
+    print(
+        "  CARLA-rendered semantic tags override the old "
+        "dataset-class mapping for these actor types:"
+    )
+
+    for (
+        actor_class,
+        type_id,
+        configured_tag,
+        actual_tag,
+    ), info in sorted(
+        overrides.items()
+    ):
+        print(
+            f"  class={actor_class:<10} "
+            f"type={type_id:<36} "
+            f"old_tag={configured_tag:<3} "
+            f"actual_tag={actual_tag:<3} "
+            f"count={info['count']:<3} "
+            f"sample_actor_ids={info['actor_ids']}"
+        )
 
 
 def find_instance_key_collisions(actors, allowed_classes):
@@ -1227,7 +1419,7 @@ def visible_bbox_from_instance(
     key = instance_key(actor, actor_class)
 
     if key in collision_keys:
-        return None, "instance_id_collision"
+        return None, "instance_id_collision", 0
 
     instance_id_16 = key[0]
     semantic_tag = key[1]
@@ -1240,7 +1432,11 @@ def visible_bbox_from_instance(
     visible_pixels = int(np.count_nonzero(mask))
 
     if visible_pixels < int(min_visible_pixels):
-        return None, "not_visible_or_too_small"
+        return (
+            None,
+            "not_visible_or_too_small",
+            visible_pixels,
+        )
 
     ys, xs = np.nonzero(mask)
 
@@ -1249,14 +1445,18 @@ def visible_bbox_from_instance(
     xmax = int(xs.max())
     ymax = int(ys.max())
 
-    return {
-        "xyxy": [xmin, ymin, xmax, ymax],
-        "visible_pixels": visible_pixels,
-        "bbox_area_px2": int(
-            (xmax - xmin + 1)
-            * (ymax - ymin + 1)
-        ),
-    }, None
+    return (
+        {
+            "xyxy": [xmin, ymin, xmax, ymax],
+            "visible_pixels": visible_pixels,
+            "bbox_area_px2": int(
+                (xmax - xmin + 1)
+                * (ymax - ymin + 1)
+            ),
+        },
+        None,
+        visible_pixels,
+    )
 
 
 ########################## 三维框几何：计算目标包围盒角点和坐标 ################################
@@ -1439,8 +1639,9 @@ def bbox_lidar_fov_status(
       - horizontal_fov
       - lower_fov / upper_fov
 
-    No occlusion test is performed. num_lidar_points is also NOT used for this
-    decision.
+    This function performs geometry-only FOV/range filtering. Occlusion and
+    actual detectability are handled separately by the real LiDAR-return
+    visibility filter.
 
     CARLA LiDAR local coordinates:
       x forward, y right, z up.
@@ -1894,6 +2095,41 @@ def build_object_annotation(
         if nearest_box_distance > max_distance:
             return None, "outside_annotation_distance"
 
+    ########################## LiDAR 可见性：使用真实点云作为目标保留的硬门槛 ################################
+
+    lidar_visibility_cfg = ann_cfg.get(
+        "lidar_visibility",
+        {},
+    )
+    lidar_visibility_enabled = bool(
+        lidar_visibility_cfg.get(
+            "enabled",
+            True,
+        )
+    )
+    min_lidar_points = int(
+        lidar_visibility_cfg.get(
+            "min_lidar_points",
+            3,
+        )
+    )
+
+    num_lidar_points = count_lidar_points_in_bbox(
+        lidar_points_xyz,
+        lidar_from_bbox,
+        extent_xyz,
+    )
+    lidar_visible = (
+        num_lidar_points
+        >= min_lidar_points
+    )
+
+    if (
+        lidar_visibility_enabled
+        and not lidar_visible
+    ):
+        return None, "insufficient_lidar_points"
+
     bbox3d_cfg = ann_cfg.get(
         "bbox3d",
         {},
@@ -1903,6 +2139,74 @@ def build_object_annotation(
         {},
     )
 
+    ########################## RGB 可见性：动态 Actor 必须通过真实实例像素硬门槛 ################################
+
+    rgb_visibility_cfg = ann_cfg.get(
+        "rgb_visibility_filter",
+        {},
+    )
+    rgb_visibility_enabled = bool(
+        rgb_visibility_cfg.get(
+            "enabled",
+            True,
+        )
+    )
+    min_rgb_visible_pixels = int(
+        rgb_visibility_cfg.get(
+            "min_visible_pixels",
+            5,
+        )
+    )
+
+    visible_bbox = None
+    visible_status = None
+    rgb_visible_pixels = None
+    rgb_visibility_evaluated = False
+
+    need_rgb_measurement = bool(
+        rgb_visibility_enabled
+        or (
+            bbox2d_cfg.get(
+                "enabled",
+                True,
+            )
+            and bbox2d_cfg.get(
+                "visible",
+                True,
+            )
+        )
+    )
+
+    if need_rgb_measurement:
+        if (
+            semantic_tags is not None
+            and instance_ids is not None
+        ):
+            (
+                visible_bbox,
+                visible_status,
+                rgb_visible_pixels,
+            ) = visible_bbox_from_instance(
+                semantic_tags,
+                instance_ids,
+                actor,
+                actor_class,
+                min_rgb_visible_pixels,
+                collision_keys,
+            )
+            rgb_visibility_evaluated = True
+        else:
+            visible_status = (
+                "instance_segmentation_unavailable"
+            )
+
+    if rgb_visibility_enabled:
+        if not rgb_visibility_evaluated:
+            return None, "rgb_visibility_unavailable"
+
+        if int(rgb_visible_pixels) < min_rgb_visible_pixels:
+            return None, "insufficient_rgb_visible_pixels"
+
     object_data = {
         "actor_id": int(actor.id),
         "instance_segmentation_id_16bit": (
@@ -1911,15 +2215,57 @@ def build_object_annotation(
         "class": actor_class,
         "type_id": actor.type_id,
         "semantic_tag": int(
-            CLASS_TO_SEMANTIC_TAG[
-                actor_class
-            ]
+            actor_instance_semantic_tag(
+                actor,
+                actor_class,
+            )
         ),
         "distance_to_bbox_center_m": center_distance,
         "distance_to_bbox_surface_approx_m": nearest_box_distance,
         "actor_pose_world": pose_dict(
             actor_transform
         ),
+        "num_lidar_points": int(
+            num_lidar_points
+        ),
+        "num_rgb_visible_pixels": (
+            int(rgb_visible_pixels)
+            if rgb_visible_pixels is not None
+            else None
+        ),
+        "visibility": {
+            "lidar": (
+                bool(lidar_visible)
+                if lidar_visibility_enabled
+                else None
+            ),
+            "lidar_status": (
+                "visible"
+                if lidar_visibility_enabled
+                else "filter_disabled"
+            ),
+            "rgb": (
+                bool(
+                    rgb_visibility_evaluated
+                    and int(rgb_visible_pixels)
+                    >= min_rgb_visible_pixels
+                )
+                if rgb_visibility_evaluated
+                else None
+            ),
+            "rgb_status": (
+                "visible"
+                if (
+                    rgb_visibility_evaluated
+                    and int(rgb_visible_pixels)
+                    >= min_rgb_visible_pixels
+                )
+                else (
+                    visible_status
+                    or "not_evaluated"
+                )
+            ),
+        },
     }
 
     if lidar_filter_enabled:
@@ -1983,18 +2329,6 @@ def build_object_annotation(
                 corners_camera_cv,
             )
 
-        if bbox3d_cfg.get(
-            "count_lidar_points",
-            True,
-        ):
-            object_data["num_lidar_points"] = (
-                count_lidar_points_in_bbox(
-                    lidar_points_xyz,
-                    lidar_from_bbox,
-                    extent_xyz,
-                )
-            )
-
         object_data["bbox3d"] = bbox3d
 
     ########################## 二维框：生成图像中的目标框 ################################
@@ -2028,35 +2362,23 @@ def build_object_annotation(
                 )
             )
 
-        if (
-            bbox2d_cfg.get(
-                "visible",
-                True,
-            )
-            and semantic_tags is not None
-            and instance_ids is not None
+        if bbox2d_cfg.get(
+            "visible",
+            True,
         ):
-            visible_bbox, status = (
-                visible_bbox_from_instance(
-                    semantic_tags,
-                    instance_ids,
-                    actor,
-                    actor_class,
-                    int(
-                        bbox2d_cfg.get(
-                            "min_visible_pixels",
-                            5,
-                        )
-                    ),
-                    collision_keys,
-                )
-            )
-
             bbox2d["visible"] = (
                 visible_bbox
+                if rgb_visibility_evaluated
+                else None
             )
             bbox2d["visible_status"] = (
-                status
+                visible_status
+                if visible_status is not None
+                else (
+                    None
+                    if rgb_visibility_evaluated
+                    else "instance_segmentation_unavailable"
+                )
             )
 
         object_data["bbox2d"] = bbox2d
@@ -2087,7 +2409,8 @@ def build_environment_object_annotation(
         the instance-segmentation stream, so bbox2d.visible is intentionally
         left unavailable. bbox2d.projected and the RGB 3D cuboid are saved.
       - LiDAR FOV filtering is identical to dynamic actors.
-      - num_lidar_points is diagnostic only; it does not decide retention.
+      - Real LiDAR returns inside the oriented 3D bbox are a hard retention
+        filter when annotations.lidar_visibility.enabled is true.
     """
     if environment_object is None:
         return None, "invalid_environment_object"
@@ -2278,6 +2601,41 @@ def build_environment_object_annotation(
                 "outside_annotation_distance",
             )
 
+    ########################## LiDAR 可见性：静态地图对象同样使用真实点云硬筛选 ################################
+
+    lidar_visibility_cfg = ann_cfg.get(
+        "lidar_visibility",
+        {},
+    )
+    lidar_visibility_enabled = bool(
+        lidar_visibility_cfg.get(
+            "enabled",
+            True,
+        )
+    )
+    min_lidar_points = int(
+        lidar_visibility_cfg.get(
+            "min_lidar_points",
+            3,
+        )
+    )
+
+    num_lidar_points = count_lidar_points_in_bbox(
+        lidar_points_xyz,
+        lidar_from_bbox,
+        extent_xyz,
+    )
+    lidar_visible = (
+        num_lidar_points
+        >= min_lidar_points
+    )
+
+    if (
+        lidar_visibility_enabled
+        and not lidar_visible
+    ):
+        return None, "insufficient_lidar_points"
+
     bbox3d_cfg = ann_cfg.get(
         "bbox3d",
         {},
@@ -2316,6 +2674,26 @@ def build_environment_object_annotation(
                 environment_object.transform
             )
         ),
+        "num_lidar_points": int(
+            num_lidar_points
+        ),
+        "num_rgb_visible_pixels": None,
+        "visibility": {
+            "lidar": (
+                bool(lidar_visible)
+                if lidar_visibility_enabled
+                else None
+            ),
+            "lidar_status": (
+                "visible"
+                if lidar_visibility_enabled
+                else "filter_disabled"
+            ),
+            "rgb": None,
+            "rgb_status": (
+                "not_available_for_static_environment_object"
+            ),
+        },
     }
 
     if lidar_filter_enabled:
@@ -2377,18 +2755,6 @@ def build_environment_object_annotation(
                 camera_cv_from_bbox,
                 size_xyz,
                 corners_camera_cv,
-            )
-
-        if bbox3d_cfg.get(
-            "count_lidar_points",
-            True,
-        ):
-            object_data[
-                "num_lidar_points"
-            ] = count_lidar_points_in_bbox(
-                lidar_points_xyz,
-                lidar_from_bbox,
-                extent_xyz,
             )
 
         object_data[
@@ -2461,15 +2827,30 @@ def build_frame_annotations(
         {},
     )
 
-    if (
-        bbox2d_cfg.get(
+    rgb_visibility_cfg = ann_cfg.get(
+        "rgb_visibility_filter",
+        {},
+    )
+
+    need_instance_visibility = bool(
+        rgb_visibility_cfg.get(
             "enabled",
             True,
         )
-        and bbox2d_cfg.get(
-            "visible",
-            True,
+        or (
+            bbox2d_cfg.get(
+                "enabled",
+                True,
+            )
+            and bbox2d_cfg.get(
+                "visible",
+                True,
+            )
         )
+    )
+
+    if (
+        need_instance_visibility
         and instance_image is not None
     ):
         semantic_tags, instance_ids = (
@@ -2488,6 +2869,9 @@ def build_frame_annotations(
         "saved_objects": 0,
         "filtered_outside_lidar_fov": 0,
         "filtered_outside_annotation_distance": 0,
+        "filtered_insufficient_lidar_points": 0,
+        "filtered_insufficient_rgb_visible_pixels": 0,
+        "filtered_rgb_visibility_unavailable": 0,
     }
 
     ########################## 动态对象：处理会移动的交通对象 ################################
@@ -2580,6 +2964,30 @@ def build_frame_annotations(
                 "filtered_outside_annotation_distance"
             ] += 1
 
+        elif (
+            reject_reason
+            == "insufficient_lidar_points"
+        ):
+            stats[
+                "filtered_insufficient_lidar_points"
+            ] += 1
+
+        elif (
+            reject_reason
+            == "insufficient_rgb_visible_pixels"
+        ):
+            stats[
+                "filtered_insufficient_rgb_visible_pixels"
+            ] += 1
+
+        elif (
+            reject_reason
+            == "rgb_visibility_unavailable"
+        ):
+            stats[
+                "filtered_rgb_visibility_unavailable"
+            ] += 1
+
     ########################## 静态地图对象：处理地图中的固定对象 ################################
 
     for item in environment_objects:
@@ -2659,6 +3067,14 @@ def build_frame_annotations(
                 "filtered_outside_annotation_distance"
             ] += 1
 
+        elif (
+            reject_reason
+            == "insufficient_lidar_points"
+        ):
+            stats[
+                "filtered_insufficient_lidar_points"
+            ] += 1
+
     return objects, stats
 
 
@@ -2695,8 +3111,18 @@ def draw_debug_bboxes(
 
         projected = bbox2d.get("projected")
         visible = bbox2d.get("visible")
+        rgb_visibility = obj.get(
+            "visibility",
+            {},
+        ).get(
+            "rgb",
+            None,
+        )
 
-        if projected is not None:
+        if (
+            projected is not None
+            and rgb_visibility is not False
+        ):
             x1, y1, x2, y2 = projected["xyxy"]
 
             cv2.rectangle(
@@ -3044,6 +3470,11 @@ def main():
         collision_keys = set()
 
         if ANNOTATIONS_ENABLED:
+            print_dynamic_semantic_tag_audit(
+                tracked_actors,
+                allowed_classes,
+            )
+
             collision_keys = (
                 find_instance_key_collisions(
                     tracked_actors,
@@ -3098,15 +3529,28 @@ def main():
             {},
         )
 
+        rgb_visibility_cfg = ann_cfg.get(
+            "rgb_visibility_filter",
+            {},
+        )
+
         NEED_INSTANCE_CAMERA = bool(
             ANNOTATIONS_ENABLED
-            and bbox2d_cfg.get(
-                "enabled",
-                True,
-            )
-            and bbox2d_cfg.get(
-                "visible",
-                True,
+            and (
+                rgb_visibility_cfg.get(
+                    "enabled",
+                    True,
+                )
+                or (
+                    bbox2d_cfg.get(
+                        "enabled",
+                        True,
+                    )
+                    and bbox2d_cfg.get(
+                        "visible",
+                        True,
+                    )
+                )
             )
         )
 
@@ -3427,11 +3871,11 @@ def main():
                 ),
                 "instance_id_decoding": (
                     "(B << 8) | G from raw BGRA; "
-                    "CARLA 0.9.16 ActorID when available"
+                    "CARLA 0.9.16 ActorID when available; semantic tag resolved from actor.semantic_tags"
                 ),
                 "van_note": (
                     "Dataset class 'van' comes from vehicle "
-                    "base_type; CARLA semantic tag is Car=14."
+                    "base_type; dynamic CARLA semantic tag is resolved from actor.semantic_tags."
                 ),
                 "lidar_fov_filter": {
                     "enabled": bool(
@@ -3466,7 +3910,64 @@ def main():
                         lidar_cfg["upper_fov"]
                     ),
                     "uses_occlusion": False,
-                    "uses_num_lidar_points_for_filtering": False,
+                    "role": "geometry_prefilter_only",
+                },
+                "lidar_visibility": {
+                    "enabled": bool(
+                        ann_cfg.get(
+                            "lidar_visibility",
+                            {},
+                        ).get(
+                            "enabled",
+                            True,
+                        )
+                    ),
+                    "method": (
+                        "actual_lidar_returns_inside_oriented_bbox"
+                    ),
+                    "min_lidar_points": int(
+                        ann_cfg.get(
+                            "lidar_visibility",
+                            {},
+                        ).get(
+                            "min_lidar_points",
+                            3,
+                        )
+                    ),
+                    "uses_actual_lidar_returns": True,
+                    "acts_as_hard_retention_filter": True,
+                },
+                "rgb_visibility_filter": {
+                    "enabled": bool(
+                        ann_cfg.get(
+                            "rgb_visibility_filter",
+                            {},
+                        ).get(
+                            "enabled",
+                            True,
+                        )
+                    ),
+                    "source": (
+                        "sensor.camera.instance_segmentation"
+                    ),
+                    "min_visible_pixels": int(
+                        ann_cfg.get(
+                            "rgb_visibility_filter",
+                            {},
+                        ).get(
+                            "min_visible_pixels",
+                            5,
+                        )
+                    ),
+                    "dynamic_actor_policy": (
+                        "Dynamic actors must pass both LiDAR and RGB "
+                        "visibility thresholds to be written to labels."
+                    ),
+                    "static_environment_policy": (
+                        "Static EnvironmentObjects use the LiDAR hard "
+                        "threshold only because reliable ActorID RGB pixel "
+                        "ownership is unavailable."
+                    ),
                 },
             },
         }
@@ -3623,6 +4124,9 @@ def main():
                 "saved_objects": 0,
                 "filtered_outside_lidar_fov": 0,
                 "filtered_outside_annotation_distance": 0,
+                "filtered_insufficient_lidar_points": 0,
+                "filtered_insufficient_rgb_visible_pixels": 0,
+                "filtered_rgb_visibility_unavailable": 0,
             }
 
             if ANNOTATIONS_ENABLED:
@@ -3768,6 +4272,12 @@ def main():
                 f"static={annotation_stats['saved_static_objects']} "
                 f"fov_drop="
                 f"{annotation_stats['filtered_outside_lidar_fov']} "
+                f"lidar_drop="
+                f"{annotation_stats['filtered_insufficient_lidar_points']} "
+                f"rgb_drop="
+                f"{annotation_stats['filtered_insufficient_rgb_visible_pixels']} "
+                f"rgb_na="
+                f"{annotation_stats['filtered_rgb_visibility_unavailable']} "
                 f"visible2d={visible_2d_count} "
                 f"distance="
                 f"{route_distance:.1f}/"

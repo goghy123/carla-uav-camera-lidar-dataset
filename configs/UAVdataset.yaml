@@ -18,7 +18,7 @@ recording:
 traffic:
   enabled: true
 
-  num_vehicles: 80
+  num_vehicles: 120
   num_pedestrians: 30
 
   tm_port: 8000
@@ -99,9 +99,9 @@ annotations:
     - van
     - truck
     - bus
-    - motorcycle
-    - bicycle
-    - pedestrian
+#    - motorcycle
+#    - bicycle
+#    - pedestrian
 
   max_distance_m: 120.0
 
@@ -117,16 +117,32 @@ annotations:
       - car
       - truck
       - bus
-      - motorcycle
-      - bicycle
+#      - motorcycle
+#      - bicycle
 
 
 
   lidar_fov_filter:
     enabled: true
-    # 目标包围盒只要有采样点落入量程和水平/垂直视场，就会保留。
-    # 不做遮挡判断；点数统计只用于诊断，不决定是否保留。
+    # 第一层几何筛选：目标包围盒至少有一个采样点落入 LiDAR 的量程与视场。
+    # 这里本身不判断遮挡，遮挡/可探测性由下面的 lidar_visibility 继续筛选。
     bbox_samples_per_axis: 5
+
+
+
+  lidar_visibility:
+    enabled: true
+    # 动态目标和静态 EnvironmentObject 都必须满足这个真实 LiDAR 点数门槛。
+    min_lidar_points: 15
+
+
+
+  rgb_visibility_filter:
+    enabled: true
+    # 动态 Actor 还必须在 instance segmentation 中达到真实可见像素门槛。
+    # 动态目标只要 LiDAR < 3 或 RGB visible pixels < 5，就不会写入 labels。
+    # 静态 EnvironmentObject 没有可靠 ActorID 像素归属，因此只使用 LiDAR 门槛。
+    min_visible_pixels: 15
 
 
 
@@ -139,7 +155,7 @@ annotations:
     save_lidar: true
     save_camera: true
 
-    count_lidar_points: true
+    # num_lidar_points 由 lidar_visibility 统一统计并写入标注。
 
 
 
@@ -151,8 +167,8 @@ annotations:
     projected: true
     visible: true
 
-    min_visible_pixels: 5
-
+    # visible bbox 与录制阶段 RGB 硬筛选共用
+    # annotations.rgb_visibility_filter.min_visible_pixels。
     near_clip_m: 0.05
 
 
