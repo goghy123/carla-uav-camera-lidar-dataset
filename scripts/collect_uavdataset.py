@@ -81,6 +81,42 @@ def load_yaml(path):
         return yaml.load(f)
 
 
+def validate_route_schema(route_root, route_path):
+    """Require the current route schema only; legacy route files are rejected."""
+    if not isinstance(route_root, dict):
+        raise ValueError(f"Route file {route_path} must contain a mapping at the top level.")
+
+    route = route_root.get("route")
+    if not isinstance(route, dict):
+        raise ValueError(f"Route file {route_path} must contain a 'route' mapping.")
+
+    required = ("name", "map", "anchors", "planned_path")
+    missing = [key for key in required if key not in route]
+    if missing:
+        raise ValueError(
+            f"Route file {route_path} is not in the current route format; "
+            f"missing fields: {', '.join(missing)}"
+        )
+
+    extra = [key for key in route if key not in required]
+    if extra:
+        raise ValueError(
+            f"Route file {route_path} contains unsupported route fields: "
+            f"{', '.join(map(str, extra))}"
+        )
+
+    if not isinstance(route["name"], str) or not route["name"].strip():
+        raise ValueError(f"Route file {route_path}: route.name must be a non-empty string.")
+    if not isinstance(route["map"], str) or not route["map"].strip():
+        raise ValueError(f"Route file {route_path}: route.map must be a non-empty string.")
+    if not isinstance(route["anchors"], list):
+        raise ValueError(f"Route file {route_path}: route.anchors must be a list.")
+    if not isinstance(route["planned_path"], list):
+        raise ValueError(f"Route file {route_path}: route.planned_path must be a list.")
+
+    return route
+
+
 def load_config():
     config = load_yaml(CONFIG_PATH)
 
@@ -93,19 +129,14 @@ def load_config():
         )
 
     route_config = load_yaml(route_path)
+    route = validate_route_schema(route_config, route_path)
 
-    if "route" not in route_config:
-        raise KeyError(
-            f"\nMissing 'route:' in:\n{route_path}"
-        )
-
-    config["uav"]["route"] = route_config["route"]
+    config["uav"]["route"] = route
     config["uav"]["route_source"] = str(route_path)
 
     print("\nRoute configuration:")
     print("  file :", route_path)
-    print("  name :", route_config["route"].get("name", "unnamed"))
-    print("  mode :", route_config["route"].get("mode", "unknown"))
+    print("  name :", route["name"])
 
     return config
 
@@ -406,9 +437,10 @@ def get_frame(sensor_queue, target_frame, name, timeout=10.0):
 
 ########################## UAV 路线：读取航点并计算无人机的移动目标 ################################
 
+
 class UAVRoute:
 
-    def __init__(self, uav_config, fps):
+    def __init__(self, uav_config, route_planner_config, fps):
         self.fps = float(fps)
 
         if self.fps <= 0:
@@ -421,44 +453,42 @@ class UAVRoute:
 
         self.distance_per_frame = self.speed / self.fps
 
-        initial = uav_config["initial_pose"]
-
-        self.initial = carla.Transform(
-            carla.Location(
-                x=float(initial["x"]),
-                y=float(initial["y"]),
-                z=float(initial["z"]),
-            ),
-            carla.Rotation(
-                pitch=float(initial["pitch"]),
-                yaw=float(initial["yaw"]),
-                roll=float(initial["roll"]),
-            ),
-        )
-
         route = uav_config["route"]
 
-        self.name = str(route.get("name", "unnamed"))
-        self.mode = str(route["mode"]).lower()
-        self.heading_mode = str(
-            route.get("heading_mode", "follow_route")
-        ).lower()
+        self.name = str(route["name"])
+        self.map_name = str(route["map"])
 
-        if self.mode not in ("static", "waypoints"):
-            raise ValueError(f"Unsupported route mode: {self.mode}")
+        self.altitude_m = float(
+            uav_config["altitude_above_road_m"]
+        )
 
-        if (
-            self.mode == "waypoints"
-            and self.heading_mode != "follow_route"
-        ):
+        if self.altitude_m <= 0:
             raise ValueError(
-                "Currently only 'heading_mode: follow_route' is supported."
+                "uav.altitude_above_road_m must be > 0"
+            )
+
+        self.heading_lookahead_m = float(
+            uav_config["heading_lookahead_m"]
+        )
+
+        if self.heading_lookahead_m <= 0:
+            raise ValueError(
+                "uav.heading_lookahead_m must be > 0"
+            )
+
+        self.planner_resolution_m = float(
+            route_planner_config["sampling_resolution_m"]
+        )
+
+        if self.planner_resolution_m <= 0:
+            raise ValueError(
+                "route_planner.sampling_resolution_m must be > 0"
             )
 
         self.points = []
         duplicate_count = 0
 
-        for index, p in enumerate(route.get("waypoints", [])):
+        for index, p in enumerate(route["planned_path"]):
             point = np.array(
                 [
                     float(p["x"]),
@@ -469,12 +499,19 @@ class UAVRoute:
             )
 
             if self.points:
-                d = np.linalg.norm(point - self.points[-1])
+                # Flight progress is defined in the XY plane. Consecutive
+                # points with identical XY therefore have zero route length
+                # even if their road z differs slightly.
+                d_xy = float(
+                    np.linalg.norm(
+                        point[:2] - self.points[-1][:2]
+                    )
+                )
 
-                if d <= 1e-6:
+                if d_xy <= 1e-6:
                     duplicate_count += 1
                     print(
-                        "WARNING: removed duplicated waypoint "
+                        "WARNING: removed zero-XY-length planned_path point "
                         f"#{index}: "
                         f"({point[0]:.3f}, {point[1]:.3f}, {point[2]:.3f})"
                     )
@@ -484,113 +521,204 @@ class UAVRoute:
 
         if duplicate_count > 0:
             print(
-                f"Removed {duplicate_count} duplicated waypoint(s)."
+                f"Removed {duplicate_count} zero-XY-length "
+                "planned_path point(s)."
+            )
+
+        if len(self.points) < 2:
+            raise ValueError(
+                "route.planned_path requires at least 2 unique XY points. "
+                "Create and save the route with scripts/route_editor.py first."
             )
 
         self.segment_lengths = []
-        self.total_length = 0.0
+        cumulative = [0.0]
 
-        if len(self.points) >= 2:
-            for i in range(len(self.points) - 1):
-                length = float(
-                    np.linalg.norm(
-                        self.points[i + 1] - self.points[i]
-                    )
+        for i in range(len(self.points) - 1):
+            length = float(
+                np.linalg.norm(
+                    self.points[i + 1][:2] - self.points[i][:2]
                 )
+            )
 
-                self.segment_lengths.append(length)
-                self.total_length += length
+            if length <= 1e-9:
+                continue
 
-        if self.mode == "waypoints":
-            if len(self.points) < 2:
-                raise ValueError(
-                    "Waypoint route requires at least 2 unique waypoints."
-                )
+            self.segment_lengths.append(length)
+            cumulative.append(cumulative[-1] + length)
 
-            if self.total_length <= 1e-6:
-                raise ValueError("Route length is zero.")
+        self.cumulative_distances = np.asarray(
+            cumulative,
+            dtype=np.float64,
+        )
+        self.total_length = float(self.cumulative_distances[-1])
+
+        if self.total_length <= 1e-6:
+            raise ValueError("route.planned_path XY length is zero.")
+
+        if len(self.segment_lengths) != len(self.points) - 1:
+            raise RuntimeError(
+                "Internal route preprocessing mismatch after removing "
+                "zero-length points."
+            )
+
+        self.max_segment_length_m = max(self.segment_lengths)
+        allowed_max_segment = max(
+            10.0,
+            self.planner_resolution_m * 20.0,
+        )
+
+        if self.max_segment_length_m > allowed_max_segment:
+            raise ValueError(
+                "route.planned_path contains an unexpected XY jump: "
+                f"max_segment={self.max_segment_length_m:.3f} m, "
+                f"allowed={allowed_max_segment:.3f} m. Re-open "
+                "scripts/route_editor.py and inspect the route."
+            )
+
+    @staticmethod
+    def _map_short_name(world_map):
+        return str(world_map.name).replace("\\", "/").split("/")[-1]
+
+    def validate_world_map(self, world_map):
+        if not self.map_name:
+            raise ValueError(
+                "route.map is empty. Save the route with "
+                "scripts/route_editor.py before recording."
+            )
+
+        current_map = self._map_short_name(world_map)
+
+        if current_map != self.map_name:
+            raise RuntimeError(
+                "Route/map mismatch: route_01.yaml was planned for "
+                f"'{self.map_name}', but CARLA is currently running "
+                f"'{current_map}'. Re-open route_editor.py on the intended map "
+                "and save the route again."
+            )
 
     def required_frames(self):
-        if self.mode != "waypoints":
-            return None
-
         movement_intervals = math.ceil(
             self.total_length / self.distance_per_frame
         )
-
         return movement_intervals + 1
 
     def estimated_duration(self):
-        if self.mode != "waypoints":
-            return None
-
         return self.total_length / self.speed
 
     def distance_at_frame(self, frame_index):
-        if self.mode != "waypoints":
-            return 0.0
-
         return min(
             float(frame_index) * self.distance_per_frame,
             self.total_length,
         )
 
     def is_finished(self, frame_index):
-        if self.mode != "waypoints":
-            return False
-
         return (
             self.distance_at_frame(frame_index)
             >= self.total_length - 1e-6
         )
 
-    def pose_at_frame(self, frame_index):
-        if self.mode == "static":
-            return self.initial
+    def road_point_at_distance(self, distance):
+        distance = float(
+            np.clip(distance, 0.0, self.total_length)
+        )
 
+        if distance >= self.total_length - 1e-9:
+            return self.points[-1].copy()
+
+        segment_index = int(
+            np.searchsorted(
+                self.cumulative_distances,
+                distance,
+                side="right",
+            ) - 1
+        )
+        segment_index = int(
+            np.clip(
+                segment_index,
+                0,
+                len(self.segment_lengths) - 1,
+            )
+        )
+
+        segment_start_distance = self.cumulative_distances[segment_index]
+        segment_length = self.segment_lengths[segment_index]
+        ratio = (distance - segment_start_distance) / segment_length
+        ratio = float(np.clip(ratio, 0.0, 1.0))
+
+        start = self.points[segment_index]
+        end = self.points[segment_index + 1]
+
+        return start + ratio * (end - start)
+
+    def yaw_at_distance(self, distance):
+        distance = float(
+            np.clip(distance, 0.0, self.total_length)
+        )
+
+        forward_distance = min(
+            distance + self.heading_lookahead_m,
+            self.total_length,
+        )
+
+        if forward_distance - distance > 1e-6:
+            start = self.road_point_at_distance(distance)
+            end = self.road_point_at_distance(forward_distance)
+        else:
+            # At the endpoint there is no forward sample. Use a short incoming
+            # chord (no longer than one dataset movement step) so the last frame
+            # keeps the local arrival heading instead of jumping back to a much
+            # longer backward-lookahead direction.
+            backward_span = min(
+                self.heading_lookahead_m,
+                self.distance_per_frame,
+            )
+            backward_distance = max(
+                0.0,
+                distance - backward_span,
+            )
+            start = self.road_point_at_distance(backward_distance)
+            end = self.road_point_at_distance(distance)
+
+        direction = end[:2] - start[:2]
+
+        if float(np.linalg.norm(direction)) <= 1e-9:
+            # Extremely short/local degenerate geometry: fall back to the
+            # nearest non-zero stored segment.
+            segment_index = min(
+                int(
+                    np.searchsorted(
+                        self.cumulative_distances,
+                        distance,
+                        side="right",
+                    ) - 1
+                ),
+                len(self.segment_lengths) - 1,
+            )
+            segment_index = max(segment_index, 0)
+            direction = (
+                self.points[segment_index + 1][:2]
+                - self.points[segment_index][:2]
+            )
+
+        return math.degrees(
+            math.atan2(direction[1], direction[0])
+        )
+
+    def pose_at_frame(self, frame_index):
         return self.pose_at_distance(
             self.distance_at_frame(frame_index)
         )
 
     def pose_at_distance(self, distance):
-        if self.mode == "static":
-            return self.initial
-
-        distance = float(
-            np.clip(distance, 0.0, self.total_length)
-        )
-
-        remaining = distance
-        selected_segment = len(self.segment_lengths) - 1
-        segment_remaining = self.segment_lengths[selected_segment]
-
-        for i, length in enumerate(self.segment_lengths):
-            if remaining <= length:
-                selected_segment = i
-                segment_remaining = remaining
-                break
-
-            remaining -= length
-
-        start = self.points[selected_segment]
-        end = self.points[selected_segment + 1]
-        length = self.segment_lengths[selected_segment]
-
-        ratio = 0.0 if length <= 1e-9 else segment_remaining / length
-        ratio = float(np.clip(ratio, 0.0, 1.0))
-
-        position = start + ratio * (end - start)
-        direction = end - start
-
-        yaw = math.degrees(
-            math.atan2(direction[1], direction[0])
-        )
+        road_position = self.road_point_at_distance(distance)
+        yaw = self.yaw_at_distance(distance)
 
         return carla.Transform(
             carla.Location(
-                x=float(position[0]),
-                y=float(position[1]),
-                z=float(position[2]),
+                x=float(road_position[0]),
+                y=float(road_position[1]),
+                z=float(road_position[2] + self.altitude_m),
             ),
             carla.Rotation(
                 pitch=0.0,
@@ -606,12 +734,6 @@ def determine_recording_frames(route, configured_num_frames):
     configured_num_frames = int(configured_num_frames)
 
     if configured_num_frames == -1:
-        if route.mode != "waypoints":
-            raise ValueError(
-                "recording.num_frames = -1 requires "
-                "'route.mode: waypoints'."
-            )
-
         return route.required_frames()
 
     if configured_num_frames <= 0:
@@ -633,28 +755,28 @@ def print_recording_plan(
 ):
     print()
     print("=" * 64)
-    print("UAV DATASET V3.2 RECORDING PLAN")
+    print("UAV DATASET V3.3 RECORDING PLAN")
     print("=" * 64)
 
     print(f"Route name             : {route.name}")
-    print(f"Route mode             : {route.mode}")
-
-    if route.mode == "waypoints":
-        print(f"Unique waypoints       : {len(route.points)}")
-        print(f"Route length           : {route.total_length:.3f} m")
-        print(f"UAV speed              : {route.speed:.3f} m/s")
-        print(f"Dataset FPS            : {fps:.3f} Hz")
-        print(
-            f"Distance / frame       : "
-            f"{route.distance_per_frame:.3f} m"
-        )
-        print(
-            f"Estimated flight time  : "
-            f"{route.estimated_duration():.3f} s"
-        )
-        print(f"Full-route frames      : {route.required_frames()}")
-    else:
-        print(f"Dataset FPS            : {fps:.3f} Hz")
+    print(f"Route map              : {route.map_name}")
+    print(f"Planned path points    : {len(route.points)}")
+    print(f"Route XY length        : {route.total_length:.3f} m")
+    print(f"UAV altitude / road    : {route.altitude_m:.3f} m")
+    print(f"Planner resolution     : {route.planner_resolution_m:.3f} m")
+    print(f"Max stored XY segment  : {route.max_segment_length_m:.3f} m")
+    print(f"Heading lookahead      : {route.heading_lookahead_m:.3f} m")
+    print(f"UAV XY speed           : {route.speed:.3f} m/s")
+    print(f"Dataset FPS            : {fps:.3f} Hz")
+    print(
+        f"XY distance / frame    : "
+        f"{route.distance_per_frame:.3f} m"
+    )
+    print(
+        f"Estimated flight time  : "
+        f"{route.estimated_duration():.3f} s"
+    )
+    print(f"Full-route frames      : {route.required_frames()}")
 
     recording_mode = (
         "UNTIL_ROUTE_END"
@@ -666,10 +788,7 @@ def print_recording_plan(
     print(f"Configured frames      : {configured_num_frames}")
     print(f"Actual frames          : {actual_num_frames}")
 
-    if (
-        route.mode == "waypoints"
-        and configured_num_frames > 0
-    ):
+    if configured_num_frames > 0:
         movement_distance = max(
             configured_num_frames - 1,
             0,
@@ -3232,6 +3351,7 @@ def main():
 
     route = UAVRoute(
         uav_cfg,
+        config["route_planner"],
         FPS,
     )
 
@@ -3257,6 +3377,7 @@ def main():
     client.set_timeout(20.0)
 
     world = client.get_world()
+    route.validate_world_map(world.get_map())
     original_settings = world.get_settings()
 
     server_version = client.get_server_version()
@@ -3267,7 +3388,7 @@ def main():
 
     if not str(server_version).startswith("0.9.16"):
         print(
-            "WARNING: this v3.2 collector is designed for CARLA 0.9.16. "
+            "WARNING: this v3.3 collector is designed for CARLA 0.9.16. "
             "Visible 2D instance-to-ActorID matching may not be reliable "
             "on older releases."
         )
@@ -3669,8 +3790,24 @@ def main():
             "dataset_fps_hz": float(FPS),
             "uav_speed_mps": float(route.speed),
             "route_name": route.name,
+            "route_map": route.map_name,
             "route_length_m": float(
                 route.total_length
+            ),
+            "planned_path_points": int(
+                len(route.points)
+            ),
+            "planner_sampling_resolution_m": float(
+                route.planner_resolution_m
+            ),
+            "max_planned_path_segment_m": float(
+                route.max_segment_length_m
+            ),
+            "uav_altitude_above_road_m": float(
+                route.altitude_m
+            ),
+            "heading_lookahead_m": float(
+                route.heading_lookahead_m
             ),
             "K": K.tolist(),
             "camera_resolution": [
@@ -3741,7 +3878,7 @@ def main():
 
         metadata = {
             "scene_name": scene_name,
-            "collector_version": "uav_v3.2",
+            "collector_version": "uav_v3.3",
             "carla_client_version": client_version,
             "carla_server_version": server_version,
             "dataset_fps_hz": float(FPS),
@@ -3769,8 +3906,21 @@ def main():
             "route_length_m": float(
                 route.total_length
             ),
-            "unique_waypoints": int(
+            "planned_path_points": int(
                 len(route.points)
+            ),
+            "route_map": route.map_name,
+            "planner_sampling_resolution_m": float(
+                route.planner_resolution_m
+            ),
+            "max_planned_path_segment_m": float(
+                route.max_segment_length_m
+            ),
+            "uav_altitude_above_road_m": float(
+                route.altitude_m
+            ),
+            "heading_lookahead_m": float(
+                route.heading_lookahead_m
             ),
             "traffic_requested": {
                 "vehicles": int(
@@ -4004,10 +4154,7 @@ def main():
             )
 
             route_progress = (
-                route_distance
-                / route.total_length
-                if route.mode == "waypoints"
-                else 0.0
+                route_distance / route.total_length
             )
 
             camera_tf = sensor_world_transform(
@@ -4299,10 +4446,7 @@ def main():
         print("Scene:")
         print(scene_dir)
 
-        if (
-            CONFIGURED_NUM_FRAMES == -1
-            and route.mode == "waypoints"
-        ):
+        if CONFIGURED_NUM_FRAMES == -1:
             final_distance = (
                 route.distance_at_frame(
                     NUM_FRAMES - 1
@@ -4318,7 +4462,7 @@ def main():
                 f"{route.total_length:.3f} m"
             )
             print(
-                "Final waypoint reached:",
+                "Final route endpoint reached:",
                 route.is_finished(
                     NUM_FRAMES - 1
                 ),

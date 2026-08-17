@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import QMainWindow
 
 
 # python scripts/play_uavdataset.py `
-#     --scene dataset\scene_20260816_190100 `
+#     --scene dataset\scene_20260817_171325 `
 #     --fps 15 `
 #     --range 80 `
 #     --max-points 0 `

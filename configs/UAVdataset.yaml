@@ -30,21 +30,27 @@ traffic:
   pedestrian_speed_max_mps: 2.0
 
 
-########################## UAV 设置：定义初始位置、速度和路线 ################################
+########################## UAV 设置：定义飞行参数和当前录制路线 ################################
 
 uav:
+  # 水平（XY）巡航速度。道路高程变化只影响 UAV 的 z，不改变 XY 速度定义。
   speed_mps: 8.0
 
-  initial_pose:
-    x: -60.5942
-    y: 138.0428
-    z: 50.0000
+  # UAV 始终保持在 planned_path 道路原始 z 之上该高度。
+  altitude_above_road_m: 50.0
 
-    pitch: 0.0
-    yaw: -2.2371
-    roll: 0.0
+  # collector 使用最终路线前方指定距离的位置计算 yaw，使转弯朝向更平滑。
+  heading_lookahead_m: 5.0
 
-  route_file: "routes/route_01.yaml"
+  # 当前用于录制的路线。route_editor.py 保存指定路线后会自动更新这里。
+  route_file: "routes/route_00.yaml"
+
+
+########################## 路线规划：只在 route_editor.py 中使用 ################################
+
+route_planner:
+  # GlobalRoutePlanner 生成并固化 planned_path 时的道路采样间距。
+  sampling_resolution_m: 0.5
 
 
 ########################## 传感器安装：定义相机和 LiDAR 的位置与参数 ################################
