@@ -3326,6 +3326,93 @@ def configure_camera_blueprint(
         bp.set_attribute("lens_kcube", "0.0")
 
 
+
+########################## 地图加载：根据 route.map 自动准备 CARLA world ################################
+
+
+def map_name_from_value(value):
+    """从 CARLA 地图完整路径或短名称中提取短名称。"""
+    return str(value).replace("\\", "/").split("/")[-1]
+
+
+def resolve_carla_map_identifier(client, requested_map_name):
+    """
+    将 route.map 中的短名称解析为 CARLA 服务器返回的完整地图标识。
+    这样同时兼容 TownXX、TownXX_Opt 和以后安装的其他地图。
+    """
+    requested = map_name_from_value(requested_map_name).lower()
+
+    for available_map in client.get_available_maps():
+        if map_name_from_value(available_map).lower() == requested:
+            return str(available_map)
+
+    return None
+
+
+def prepare_world_for_route(
+    client,
+    route,
+    auto_load_route_map=True,
+):
+    """
+    确保 CARLA 当前 world 与 route.map 一致。
+
+    auto_load_route_map=True:
+        不一致时自动 client.load_world(route.map)，加载后再次严格校验。
+
+    auto_load_route_map=False:
+        保留旧行为，仅严格校验；不一致就直接报错。
+    """
+    world = client.get_world()
+    current_map = route._map_short_name(world.get_map())
+
+    if current_map == route.map_name:
+        print(f"\nCARLA 地图已匹配路线：{current_map}")
+        return world
+
+    if not auto_load_route_map:
+        route.validate_world_map(world.get_map())
+        return world
+
+    map_identifier = resolve_carla_map_identifier(
+        client,
+        route.map_name,
+    )
+
+    if map_identifier is None:
+        available_short_names = sorted(
+            {
+                map_name_from_value(name)
+                for name in client.get_available_maps()
+            }
+        )
+        raise RuntimeError(
+            "路线要求的 CARLA 地图未安装或服务器不可用："
+            f"route.map='{route.map_name}'。"
+            f" 当前可用地图：{available_short_names}"
+        )
+
+    print(
+        "\nCARLA 当前地图与路线不一致："
+        f" current='{current_map}', route='{route.map_name}'"
+    )
+    print(
+        f"simulation.auto_load_route_map=true，"
+        f"正在自动加载路线地图：{route.map_name}"
+    )
+
+    # 此处发生在生成 traffic / sensors / UAV 之前，因此不会销毁本次采集对象。
+    world = client.load_world(map_identifier)
+
+    loaded_map = route._map_short_name(world.get_map())
+    print(f"CARLA 地图加载完成：{loaded_map}")
+
+    # 加载后仍执行原有严格检查，避免 CARLA 返回了意外 world。
+    route.validate_world_map(world.get_map())
+
+    return world
+
+
 ########################## 程序入口：读取配置并启动工具 ################################
 
 def main():
@@ -3376,8 +3463,15 @@ def main():
     )
     client.set_timeout(20.0)
 
-    world = client.get_world()
-    route.validate_world_map(world.get_map())
+    AUTO_LOAD_ROUTE_MAP = bool(
+        sim_cfg.get("auto_load_route_map", True)
+    )
+
+    world = prepare_world_for_route(
+        client,
+        route,
+        auto_load_route_map=AUTO_LOAD_ROUTE_MAP,
+    )
     original_settings = world.get_settings()
 
     server_version = client.get_server_version()

@@ -43,13 +43,13 @@ def normalize_route_name(value):
         name = name[:-5]
 
     if not name:
-        raise ValueError("Route name cannot be empty.")
+        raise ValueError("路线名称不能为空。")
 
     # Route files stay flat under configs/routes. Existing files with the same
     # name are intentionally reused/overwritten without an overwrite prompt.
     if name in {".", ".."} or re.search(r'[<>:"/\\|?*]', name):
         raise ValueError(
-            "Route name contains invalid filename characters: " + name
+            "路线名称包含不能用于文件名的字符: " + name
         )
 
     return name
@@ -390,11 +390,11 @@ def save_current_route(
     sampling_resolution,
 ):
     if len(anchors) < 2:
-        print("\nCannot save: at least 2 anchors are required.")
+        print("\n无法保存：至少需要 2 个 Anchor。")
         return False
 
     if len(planned_path) < 2 or polyline_xy_length(planned_path) <= 1e-6:
-        print("\nCannot save: planned_path is empty or invalid.")
+        print("\n无法保存：planned_path 为空或无效。")
         return False
 
     try:
@@ -403,7 +403,7 @@ def save_current_route(
             sampling_resolution,
         )
     except RuntimeError as exc:
-        print(f"\nCannot save: {exc}")
+        print(f"\n无法保存：{exc}")
         return False
 
     # Route YAML stores route-specific data only. Shared UAV/planner parameters
@@ -422,7 +422,7 @@ def save_current_route(
     config["uav"]["route_file"] = f"routes/{route_name}.yaml"
     save_yaml(CONFIG_PATH, config)
 
-    print("\nRoute saved:")
+    print("\n路线已保存：")
     print(route_path)
     print(
         f"anchors={len(anchors)}, "
@@ -432,48 +432,279 @@ def save_current_route(
     return True
 
 
+########################## 地图与路线管理：切换地图、新建路线、加载路线 ################################
+
+
+def map_name_from_value(value):
+    """从 CARLA 地图完整路径或短名称中提取 TownXX/TownXX_Opt。"""
+    return str(value).replace("\\", "/").split("/")[-1]
+
+
+def get_available_map_entries(client):
+    """返回 [(short_name, full_name), ...]，按短名称排序并去重。"""
+    entries = []
+    seen = set()
+
+    for full_name in client.get_available_maps():
+        short_name = map_name_from_value(full_name)
+        key = short_name.lower()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        entries.append((short_name, str(full_name)))
+
+    entries.sort(key=lambda item: item[0].lower())
+    return entries
+
+
+def find_map_identifier(client, requested_map_name):
+    """把 route.map 的短名称解析成 client.load_world() 可用的地图标识。"""
+    requested = map_name_from_value(requested_map_name).lower()
+
+    for short_name, full_name in get_available_map_entries(client):
+        if short_name.lower() == requested:
+            return full_name
+
+    return None
+
+
+def choose_map(client, current_map_name, allow_cancel=True):
+    """中文地图选择菜单；支持序号、短名称、完整名称。"""
+    entries = get_available_map_entries(client)
+
+    if not entries:
+        print("\nCARLA 服务器没有返回可用地图列表。")
+        return None
+
+    print("\n================ 可用 CARLA 地图 ================")
+    for index, (short_name, _full_name) in enumerate(entries, start=1):
+        marker = "  <- 当前" if short_name == current_map_name else ""
+        print(f"[{index:02d}] {short_name}{marker}")
+    print("==================================================")
+    print("当前地图:", current_map_name)
+
+    while True:
+        if allow_cancel:
+            raw = input(
+                "\n请输入地图序号或名称（直接回车取消/保持当前地图）："
+            ).strip()
+        else:
+            raw = input(
+                "\n请输入地图序号或名称（直接回车保持当前地图）："
+            ).strip()
+
+        if not raw:
+            return None
+
+        if raw.isdigit():
+            index = int(raw)
+            if 1 <= index <= len(entries):
+                return entries[index - 1]
+            print("序号超出范围，请重新输入。")
+            continue
+
+        raw_lower = raw.lower()
+        for short_name, full_name in entries:
+            if (
+                short_name.lower() == raw_lower
+                or full_name.lower() == raw_lower
+            ):
+                return short_name, full_name
+
+        print("没有找到该地图，请输入列表中的序号或地图名称。")
+
+
+def prompt_yes_no(message, default=False):
+    """读取中文 Y/N 确认。"""
+    suffix = " [Y/n]：" if default else " [y/N]："
+
+    while True:
+        answer = input(message + suffix).strip().lower()
+
+        if not answer:
+            return default
+        if answer in ("y", "yes", "是", "好", "确认"):
+            return True
+        if answer in ("n", "no", "否", "不", "取消"):
+            return False
+
+        print("请输入 Y 或 N。")
+
+
+def build_world_context(client, sampling_resolution):
+    """从当前 CARLA world 重新获取所有地图相关对象。"""
+    world = client.get_world()
+    world_map = world.get_map()
+    spectator = world.get_spectator()
+    current_map_name = map_short_name(world_map)
+
+    print(f"\n正在为地图 {current_map_name} 构建 GlobalRoutePlanner ...")
+    planner = GlobalRoutePlanner(world_map, sampling_resolution)
+    print("GlobalRoutePlanner 已就绪。")
+
+    return world, world_map, spectator, current_map_name, planner
+
+
+def switch_world_map(client, map_identifier, sampling_resolution):
+    """
+    加载地图并完整刷新 world / map / spectator / planner。
+    load_world() 会创建新的 CARLA world，因此旧引用不能继续使用。
+    """
+    target_short_name = map_name_from_value(map_identifier)
+
+    print(f"\n正在加载地图：{target_short_name}")
+    world = client.load_world(map_identifier)
+    world_map = world.get_map()
+    spectator = world.get_spectator()
+    current_map_name = map_short_name(world_map)
+
+    if current_map_name != target_short_name:
+        print(
+            "提示：CARLA 返回的地图短名称为 "
+            f"'{current_map_name}'，将以实际加载结果为准。"
+        )
+
+    print(f"地图已加载：{current_map_name}")
+    print("正在重建 GlobalRoutePlanner ...")
+    planner = GlobalRoutePlanner(world_map, sampling_resolution)
+    print("GlobalRoutePlanner 已就绪。")
+
+    return world, world_map, spectator, current_map_name, planner
+
+
+def choose_existing_route():
+    """列出 configs/routes 下已有路线并返回所选路径；回车取消。"""
+    routes_dir = CONFIG_PATH.parent / "routes"
+    route_paths = sorted(
+        routes_dir.glob("*.yaml"),
+        key=lambda p: p.stem.lower(),
+    )
+
+    if not route_paths:
+        print("\nconfigs/routes 中没有找到任何 .yaml 路线文件。")
+        return None
+
+    print("\n================ 已有路线 ================")
+    for index, path in enumerate(route_paths, start=1):
+        print(f"[{index:02d}] {path.stem}")
+    print("==========================================")
+
+    while True:
+        raw = input(
+            "\n请输入路线序号或名称（直接回车取消）："
+        ).strip()
+
+        if not raw:
+            return None
+
+        if raw.isdigit():
+            index = int(raw)
+            if 1 <= index <= len(route_paths):
+                return route_paths[index - 1]
+            print("序号超出范围，请重新输入。")
+            continue
+
+        try:
+            wanted = normalize_route_name(raw)
+        except ValueError as exc:
+            print(exc)
+            continue
+
+        candidate = route_path_for_name(wanted)
+        if candidate.exists():
+            return candidate
+
+        print("没有找到该路线，请重新输入。")
+
+
+def print_editor_help(
+    route_name,
+    route_path,
+    current_map_name,
+    sampling_resolution,
+    altitude_m,
+    lookahead_m,
+    anchors,
+    planned_path,
+):
+    print("\n============================================")
+    print("UAV 道路路线编辑器")
+    print("============================================")
+    print("路线名称:", route_name)
+    print("路线文件:")
+    print(route_path)
+    print("当前 CARLA 地图:", current_map_name)
+    print("规划采样间距:", f"{sampling_resolution:.3f} m")
+    print("UAV 高度:", f"road_z + {altitude_m:.3f} m")
+    print("朝向前视距离:", f"{lookahead_m:.3f} m")
+    print()
+    print("在 CARLA 窗口移动 Spectator 到目标道路附近，然后切回终端按键：")
+    print()
+    print("A     将 Spectator 投影到最近 Driving lane，并添加 Anchor")
+    print("U     撤销最后一个 Anchor，并重新规划")
+    print("P     打印当前 Anchor / planned_path 信息")
+    print("M     更换 CARLA 地图")
+    print("N     新建路线（同名保存时直接覆盖）")
+    print("R     加载已有路线")
+    print("S     保存 anchors + 完整 planned_path")
+    print("C     清空当前工作路线")
+    print("Q     保存并退出")
+    print("ESC   不保存退出")
+    print()
+    print("绿色 Axx = 地面道路 Anchor")
+    print("蓝色线    = 实际 UAV 路径（road_z + altitude）")
+    print("橙色箭头  = 飞行方向")
+    print()
+    print("当前 Anchor 数量:", len(anchors))
+    print("当前 planned_path 点数:", len(planned_path))
+    print("\n等待操作...")
+
+
 ########################## 程序入口：连接 CARLA、规划并固化路线 ################################
 
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Edit the current CARLA UAV route, or pass a name to start a "
-            "new configs/routes/<name>.yaml route."
+            "编辑当前 CARLA UAV 路线；也可以传入一个名称来新建 "
+            "configs/routes/<name>.yaml。"
         )
     )
     parser.add_argument(
         "route_name",
         nargs="?",
         help=(
-            "New route name, e.g. route_02. If omitted, edit the route "
-            "currently selected in UAVdataset.yaml. A same-name file is "
-            "overwritten on save without confirmation."
+            "新路线名称，例如 route_02。省略时编辑 UAVdataset.yaml 当前选择的路线。"
+            "同名文件在保存时直接覆盖，不额外确认。"
         ),
     )
     args = parser.parse_args()
 
     config = load_yaml(CONFIG_PATH)
 
+    editing_existing_route = False
+
     if args.route_name is None:
-        # No explicit name: edit the currently selected route.
         route_name = route_name_from_config(config)
         route_path = route_path_for_name(route_name)
 
         if route_path.exists():
             route_config = load_yaml(route_path)
             route = validate_route_schema(route_config, route_path)
+
             if route["name"] != route_name:
                 raise ValueError(
-                    f"Route file name and route.name do not match: "
+                    "路线文件名和 route.name 不一致："
                     f"{route_path.name} vs {route['name']}"
                 )
+
+            editing_existing_route = True
         else:
             route_config = make_empty_route_config(route_name)
             route = route_config["route"]
     else:
-        # Explicit name: start a NEW empty route. If a file with the same name
-        # already exists, S/Q overwrites it directly with no confirmation.
         route_name = normalize_route_name(args.route_name)
         route_path = route_path_for_name(route_name)
         route_config = make_empty_route_config(route_name)
@@ -487,13 +718,11 @@ def main():
     lookahead_m = float(uav_cfg["heading_lookahead_m"])
 
     if altitude_m <= 0:
-        raise ValueError("uav.altitude_above_road_m must be > 0")
+        raise ValueError("uav.altitude_above_road_m 必须 > 0")
     if sampling_resolution <= 0:
-        raise ValueError(
-            "route_planner.sampling_resolution_m must be > 0"
-        )
+        raise ValueError("route_planner.sampling_resolution_m 必须 > 0")
     if lookahead_m <= 0:
-        raise ValueError("uav.heading_lookahead_m must be > 0")
+        raise ValueError("uav.heading_lookahead_m 必须 > 0")
 
     anchors = copy.deepcopy(route.get("anchors") or [])
     planned_path = copy.deepcopy(route.get("planned_path") or [])
@@ -501,56 +730,96 @@ def main():
     client = carla.Client("localhost", 2000)
     client.set_timeout(20.0)
 
-    world = client.get_world()
-    world_map = world.get_map()
-    spectator = world.get_spectator()
-    current_map_name = map_short_name(world_map)
+    world, world_map, spectator, current_map_name, planner = (
+        build_world_context(client, sampling_resolution)
+    )
 
     saved_map_name = route.get("map")
-    if saved_map_name and str(saved_map_name) != current_map_name:
-        print(
-            "\nWARNING: route file was saved for map "
-            f"'{saved_map_name}', but CARLA is currently on "
-            f"'{current_map_name}'. The working anchors/planned_path were "
-            "cleared to prevent accidentally re-labeling a path from another map."
-        )
-        print(
-            "The YAML file on disk is unchanged until you press S or Q."
-        )
-        anchors = []
-        planned_path = []
 
-    print("\nBuilding CARLA GlobalRoutePlanner...")
-    planner = GlobalRoutePlanner(world_map, sampling_resolution)
-    print("GlobalRoutePlanner ready.")
+    # 已有路线属于另一张地图时，优先询问是否自动切到路线地图。
+    if (
+        editing_existing_route
+        and saved_map_name
+        and str(saved_map_name) != current_map_name
+    ):
+        print(
+            "\n当前路线保存在地图 "
+            f"'{saved_map_name}'，但 CARLA 当前地图是 '{current_map_name}'。"
+        )
 
-    print("\n============================================")
-    print("UAV ROAD ROUTE EDITOR")
-    print("============================================")
-    print("Route name:", route_name)
-    print("Route file:")
-    print(route_path)
-    print("Current CARLA map:", current_map_name)
-    print("Planner resolution:", f"{sampling_resolution:.3f} m")
-    print("UAV altitude:", f"road_z + {altitude_m:.3f} m")
-    print("Heading lookahead:", f"{lookahead_m:.3f} m")
-    print("\n在 CARLA 窗口移动 Spectator 到目标道路附近，然后切回终端按键：")
-    print()
-    print("A     将 Spectator 投影到最近 Driving lane，并添加为 Anchor")
-    print("U     撤销最后一个 Anchor，并重新规划")
-    print("P     打印当前 Anchor / planned_path 信息")
-    print("S     保存 anchors + 完整 planned_path")
-    print("C     清空当前路线")
-    print("Q     保存并退出")
-    print("ESC   不保存退出")
-    print()
-    print("绿色 Axx = 地面道路 Anchor")
-    print("蓝色线    = 实际 UAV 路径（road_z + altitude）")
-    print("橙色箭头  = 飞行方向")
-    print()
-    print("当前 Anchor 数量:", len(anchors))
-    print("当前 planned_path 点数:", len(planned_path))
-    print("\n等待操作...")
+        map_identifier = find_map_identifier(client, saved_map_name)
+
+        if map_identifier is None:
+            print(
+                "CARLA 当前安装的地图列表中找不到该路线所需地图。"
+                "为避免误用其他地图坐标，编辑器将清空内存中的工作路线；"
+                "磁盘上的 YAML 不会被修改。"
+            )
+            anchors = []
+            planned_path = []
+        elif prompt_yes_no(
+            f"是否自动切换到路线地图 '{saved_map_name}'？",
+            default=True,
+        ):
+            (
+                world,
+                world_map,
+                spectator,
+                current_map_name,
+                planner,
+            ) = switch_world_map(
+                client,
+                map_identifier,
+                sampling_resolution,
+            )
+        else:
+            print(
+                "未切换地图。为避免把旧地图坐标误当成当前地图坐标，"
+                "内存中的 anchors/planned_path 已清空；磁盘 YAML 保持不变。"
+            )
+            anchors = []
+            planned_path = []
+
+    # 新建/空路线启动时提供一次地图选择。
+    if not editing_existing_route or not anchors:
+        print(
+            "\n新建或空路线可以现在选择地图；"
+            "直接回车则继续使用当前 CARLA 地图。"
+        )
+        selected = choose_map(
+            client,
+            current_map_name,
+            allow_cancel=False,
+        )
+
+        if selected is not None:
+            selected_short, selected_identifier = selected
+
+            if selected_short != current_map_name:
+                (
+                    world,
+                    world_map,
+                    spectator,
+                    current_map_name,
+                    planner,
+                ) = switch_world_map(
+                    client,
+                    selected_identifier,
+                    sampling_resolution,
+                )
+
+    dirty = False
+
+    print_editor_help(
+        route_name,
+        route_path,
+        current_map_name,
+        sampling_resolution,
+        altitude_m,
+        lookahead_m,
+        anchors,
+        planned_path,
+    )
 
     last_draw_time = 0.0
     running = True
@@ -574,7 +843,7 @@ def main():
 
         key = msvcrt.getwch().lower()
 
-        ########################## 添加 Anchor：吸附到 Driving lane 并立即重新规划 ################################
+        ########################## 添加 Anchor ################################
 
         if key == "a":
             spectator_location = spectator.get_transform().location
@@ -586,27 +855,31 @@ def main():
             )
 
             if waypoint is None:
-                print("\nNo Driving waypoint found near the Spectator.")
+                print("\nSpectator 附近没有找到 Driving waypoint。")
                 continue
 
             new_anchor = waypoint_to_anchor(waypoint)
             candidate_anchors = anchors + [new_anchor]
 
             try:
-                candidate_path = plan_full_route(planner, candidate_anchors)
+                candidate_path = plan_full_route(
+                    planner,
+                    candidate_anchors,
+                )
                 validate_planned_path_geometry(
                     candidate_path,
                     sampling_resolution,
                 )
             except RuntimeError as exc:
-                print(f"\n{exc}")
-                print("Anchor was NOT added.")
+                print(f"\n规划失败：{exc}")
+                print("本次 Anchor 未添加。")
                 continue
 
             anchors = candidate_anchors
             planned_path = candidate_path
+            dirty = True
 
-            print("\nAdded:")
+            print("\n已添加：")
             print(
                 f"A{len(anchors)-1:02d}  "
                 f"x={new_anchor['x']:.3f}  "
@@ -620,38 +893,42 @@ def main():
 
             if len(anchors) >= 2:
                 print(
-                    f"Replanned: {len(planned_path)} points, "
-                    f"{polyline_xy_length(planned_path):.3f} m"
+                    f"已重新规划：{len(planned_path)} 个点，"
+                    f"XY 长度 {polyline_xy_length(planned_path):.3f} m"
                 )
 
-        ########################## 撤销：删除最近 Anchor 并立即重新规划 ################################
+        ########################## 撤销 ################################
 
         elif key == "u":
             if not anchors:
-                print("\nNo anchor to remove.")
+                print("\n当前没有可撤销的 Anchor。")
                 continue
 
             removed = anchors[-1]
             candidate_anchors = anchors[:-1]
 
             try:
-                candidate_path = plan_full_route(planner, candidate_anchors)
+                candidate_path = plan_full_route(
+                    planner,
+                    candidate_anchors,
+                )
                 validate_planned_path_geometry(
                     candidate_path,
                     sampling_resolution,
                 )
             except RuntimeError as exc:
-                print(f"\nUnexpected re-planning failure: {exc}")
-                print("Anchor was NOT removed.")
+                print(f"\n撤销后重新规划失败：{exc}")
+                print("Anchor 未删除。")
                 continue
 
             anchors = candidate_anchors
             planned_path = candidate_path
+            dirty = True
 
-            print("\nRemoved:")
+            print("\n已撤销：")
             print(removed)
             print(
-                f"Remaining anchors={len(anchors)}, "
+                f"剩余 anchors={len(anchors)}, "
                 f"planned_path_points={len(planned_path)}"
             )
 
@@ -660,7 +937,7 @@ def main():
         elif key == "p":
             print_route(
                 route_name,
-                route.get("map"),
+                current_map_name,
                 anchors,
                 planned_path,
                 altitude_m,
@@ -668,10 +945,232 @@ def main():
                 lookahead_m,
             )
 
+        ########################## 更换地图 ################################
+
+        elif key == "m":
+            selected = choose_map(
+                client,
+                current_map_name,
+                allow_cancel=True,
+            )
+
+            if selected is None:
+                print("\n已取消更换地图。")
+                continue
+
+            selected_short, selected_identifier = selected
+
+            if selected_short == current_map_name:
+                print("\n选择的就是当前地图，不需要重新加载。")
+                continue
+
+            if anchors or planned_path:
+                if not prompt_yes_no(
+                    f"当前工作路线有 {len(anchors)} 个 Anchor。"
+                    "切换地图会清空内存中的工作路线，磁盘 YAML 不会改变。"
+                    "是否继续？",
+                    default=False,
+                ):
+                    print("已取消更换地图。")
+                    continue
+
+            try:
+                (
+                    world,
+                    world_map,
+                    spectator,
+                    current_map_name,
+                    planner,
+                ) = switch_world_map(
+                    client,
+                    selected_identifier,
+                    sampling_resolution,
+                )
+            except Exception as exc:
+                print(f"\n地图加载失败：{exc}")
+                continue
+
+            anchors = []
+            planned_path = []
+            dirty = True
+            last_draw_time = 0.0
+
+            print(
+                f"\n已切换到 {current_map_name}。"
+                "工作路线已清空；原路线 YAML 尚未被修改。"
+            )
+
+        ########################## 新建路线 ################################
+
+        elif key == "n":
+            if dirty and (anchors or planned_path):
+                if not prompt_yes_no(
+                    "当前路线有尚未保存的修改。新建路线会丢弃这些内存修改，"
+                    "是否继续？",
+                    default=False,
+                ):
+                    print("已取消新建路线。")
+                    continue
+
+            raw_name = input(
+                "\n请输入新路线名称（直接回车取消）："
+            ).strip()
+
+            if not raw_name:
+                print("已取消新建路线。")
+                continue
+
+            try:
+                new_route_name = normalize_route_name(raw_name)
+            except ValueError as exc:
+                print(exc)
+                continue
+
+            route_name = new_route_name
+            route_path = route_path_for_name(route_name)
+            route_config = make_empty_route_config(route_name)
+            route = route_config["route"]
+            anchors = []
+            planned_path = []
+            dirty = False
+
+            if route_path.exists():
+                print(
+                    f"\n注意：{route_path.name} 已存在。"
+                    "后续按 S/Q 保存时会按你的习惯直接覆盖同名文件。"
+                )
+
+            print(
+                f"\n已新建空路线：{route_name}\n"
+                f"当前地图：{current_map_name}\n"
+                "如需换地图，请按 M。"
+            )
+
+        ########################## 加载已有路线 ################################
+
+        elif key == "r":
+            if dirty and (anchors or planned_path):
+                if not prompt_yes_no(
+                    "当前路线有尚未保存的修改。加载其他路线会丢弃这些内存修改，"
+                    "是否继续？",
+                    default=False,
+                ):
+                    print("已取消加载路线。")
+                    continue
+
+            selected_route_path = choose_existing_route()
+
+            if selected_route_path is None:
+                print("已取消加载路线。")
+                continue
+
+            try:
+                selected_route_config = load_yaml(selected_route_path)
+                selected_route = validate_route_schema(
+                    selected_route_config,
+                    selected_route_path,
+                )
+                selected_route_name = normalize_route_name(
+                    selected_route["name"]
+                )
+
+                if (
+                    selected_route_path.stem
+                    != selected_route_name
+                ):
+                    raise ValueError(
+                        "路线文件名和 route.name 不一致："
+                        f"{selected_route_path.name} vs "
+                        f"{selected_route_name}"
+                    )
+            except Exception as exc:
+                print(f"\n路线读取失败：{exc}")
+                continue
+
+            selected_map_name = selected_route.get("map")
+
+            if (
+                selected_map_name
+                and selected_map_name != current_map_name
+            ):
+                map_identifier = find_map_identifier(
+                    client,
+                    selected_map_name,
+                )
+
+                if map_identifier is None:
+                    print(
+                        f"\n路线需要地图 '{selected_map_name}'，"
+                        "但 CARLA 当前可用地图中没有找到它。"
+                    )
+                    continue
+
+                if not prompt_yes_no(
+                    f"该路线属于地图 '{selected_map_name}'。"
+                    "是否自动切换到该地图并加载路线？",
+                    default=True,
+                ):
+                    print("已取消加载路线。")
+                    continue
+
+                try:
+                    (
+                        new_world,
+                        new_world_map,
+                        new_spectator,
+                        new_current_map_name,
+                        new_planner,
+                    ) = switch_world_map(
+                        client,
+                        map_identifier,
+                        sampling_resolution,
+                    )
+                except Exception as exc:
+                    print(f"\n路线地图加载失败：{exc}")
+                    continue
+
+                world = new_world
+                world_map = new_world_map
+                spectator = new_spectator
+                current_map_name = new_current_map_name
+                planner = new_planner
+
+            candidate_anchors = copy.deepcopy(
+                selected_route.get("anchors") or []
+            )
+            candidate_path = copy.deepcopy(
+                selected_route.get("planned_path") or []
+            )
+
+            try:
+                validate_planned_path_geometry(
+                    candidate_path,
+                    sampling_resolution,
+                )
+            except RuntimeError as exc:
+                print(f"\n路线几何检查失败：{exc}")
+                continue
+
+            route_name = selected_route_name
+            route_path = selected_route_path.resolve()
+            route_config = selected_route_config
+            route = selected_route
+            anchors = candidate_anchors
+            planned_path = candidate_path
+            dirty = False
+            last_draw_time = 0.0
+
+            print(
+                f"\n路线已加载：{route_name}\n"
+                f"地图：{current_map_name}\n"
+                f"Anchor 数量：{len(anchors)}\n"
+                f"planned_path 点数：{len(planned_path)}"
+            )
+
         ########################## 保存 ################################
 
         elif key == "s":
-            save_current_route(
+            if save_current_route(
                 route_path,
                 config,
                 route_name,
@@ -679,14 +1178,23 @@ def main():
                 planned_path,
                 current_map_name,
                 sampling_resolution,
-            )
+            ):
+                dirty = False
+                route["map"] = current_map_name
+                route["anchors"] = copy.deepcopy(anchors)
+                route["planned_path"] = copy.deepcopy(planned_path)
 
         ########################## 清空 ################################
 
         elif key == "c":
+            if not anchors and not planned_path:
+                print("\n当前工作路线已经是空的。")
+                continue
+
             anchors.clear()
             planned_path.clear()
-            print("\nAll anchors and planned_path cleared in the editor.")
+            dirty = True
+            print("\n当前工作路线已清空；磁盘 YAML 尚未修改。")
 
         ########################## 保存并退出 ################################
 
@@ -700,15 +1208,24 @@ def main():
                 current_map_name,
                 sampling_resolution,
             ):
+                dirty = False
                 running = False
 
         ########################## 不保存退出 ################################
 
         elif ord(key) == 27:
-            print("\nExit without saving.")
+            if dirty and (anchors or planned_path):
+                if not prompt_yes_no(
+                    "当前有尚未保存的修改。确定不保存并退出吗？",
+                    default=False,
+                ):
+                    print("继续编辑。")
+                    continue
+
+            print("\n不保存退出。")
             running = False
 
-    print("\nRoute editor closed.")
+    print("\n路线编辑器已关闭。")
 
 
 if __name__ == "__main__":
