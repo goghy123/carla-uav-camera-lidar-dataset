@@ -23,12 +23,12 @@ recording:
 traffic:
   enabled: true
 
-  num_vehicles: 120
+  num_vehicles: 800
   num_pedestrians: 30
 
   tm_port: 8000
 
-  warmup_seconds: 5.0
+  warmup_seconds: 15.0
   # 录制前先让车辆和行人散开，减少刚生成时的拥挤。
 
   pedestrian_speed_min_mps: 1.0
@@ -48,7 +48,7 @@ uav:
   heading_lookahead_m: 5.0
 
   # 当前用于录制的路线。route_editor.py 保存指定路线后会自动更新这里。
-  route_file: "routes/route_00.yaml"
+  route_file: "routes/Town01_Opt.yaml"
 
 
 ########################## 路线规划：只在 route_editor.py 中使用 ################################

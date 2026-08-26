@@ -1,6 +1,6 @@
 route:
-  name: route_00
-  map: Town01
+  name: Town01_Opt
+  map: Town01_Opt
   anchors:
     - x: -1.988
       y: 305.782

@@ -3514,9 +3514,13 @@ def main():
         / str(output_cfg["root"])
     )
 
-    scene_name = datetime.now().strftime(
-        "scene_%Y%m%d_%H%M%S"
-    )
+    # 默认数据集名称按照“scene_”+"时间"组合
+    # scene_name = datetime.now().strftime(
+    #     "scene_%Y%m%d_%H%M%S"
+    # )
+
+    # 指定数据集名称
+    scene_name = "Town01_Opt"
 
     scene_dir = output_root / scene_name
     rgb_dir = scene_dir / "rgb"
