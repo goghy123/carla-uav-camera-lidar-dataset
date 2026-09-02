@@ -2626,7 +2626,11 @@ def build_environment_object_annotation(
         T_CV_UE @ camera_ue_from_world,
     )
 
-    extent_xyz = np.array(
+    # CARLA 的部分静态 EnvironmentObject 在个别地图资产中可能返回负的 bbox extent。
+    # extent 表示包围盒在各轴方向上的“半尺寸”，几何意义上应始终为非负值。
+    # 这里只对静态目标分支做绝对值归一化，避免负 extent 导致 LiDAR 框内点统计恒为 0；
+    # 动态 Actor 的处理逻辑、Camera/LiDAR FOV、点数阈值以及数据集格式均保持不变。
+    raw_extent_xyz = np.array(
         [
             float(bbox.extent.x),
             float(bbox.extent.y),
@@ -2634,6 +2638,7 @@ def build_environment_object_annotation(
         ],
         dtype=np.float64,
     )
+    extent_xyz = np.abs(raw_extent_xyz)
 
     size_xyz = (
         2.0
