@@ -267,6 +267,26 @@ def validate_config(config):
                 "must be >= 3"
             )
 
+        camera_fov_filter_cfg = ann_cfg.get(
+            "camera_fov_filter",
+            {},
+        )
+        camera_near_clip_m = float(
+            camera_fov_filter_cfg.get(
+                "near_clip_m",
+                ann_cfg.get("bbox2d", {}).get(
+                    "near_clip_m",
+                    0.05,
+                ),
+            )
+        )
+
+        if camera_near_clip_m <= 0.0:
+            raise ValueError(
+                "annotations.camera_fov_filter.near_clip_m "
+                "must be > 0"
+            )
+
         lidar_visibility_cfg = ann_cfg.get(
             "lidar_visibility",
             {},
@@ -857,10 +877,18 @@ def print_recording_plan(
         )
 
         lidar_filter_cfg = ann_cfg.get("lidar_fov_filter", {})
+        camera_fov_filter_cfg = ann_cfg.get(
+            "camera_fov_filter",
+            {},
+        )
         lidar_visibility_cfg = ann_cfg.get("lidar_visibility", {})
         print(
             f"LiDAR FOV filter       : "
             f"{lidar_filter_cfg.get('enabled', True)}"
+        )
+        print(
+            f"Static camera FOV gate : "
+            f"{camera_fov_filter_cfg.get('enabled', True)}"
         )
         print(
             f"LiDAR visibility filter: "
@@ -2526,8 +2554,11 @@ def build_environment_object_annotation(
       - EnvironmentObject.bounding_box is already in world space in CARLA.
       - There is no reliable ActorID mapping for these static level objects in
         the instance-segmentation stream, so bbox2d.visible is intentionally
-        left unavailable. bbox2d.projected and the RGB 3D cuboid are saved.
+        left unavailable.
       - LiDAR FOV filtering is identical to dynamic actors.
+      - Static objects must also geometrically overlap the RGB camera image
+        when annotations.camera_fov_filter.enabled is true. Objects fully
+        outside the camera FOV are discarded before annotation is written.
       - Real LiDAR returns inside the oriented 3D bbox are a hard retention
         filter when annotations.lidar_visibility.enabled is true.
     """
@@ -2720,6 +2751,42 @@ def build_environment_object_annotation(
                 "outside_annotation_distance",
             )
 
+    ########################## Camera FOV：静态地图对象必须进入 RGB 相机画面 ################################
+
+    camera_fov_filter_cfg = ann_cfg.get(
+        "camera_fov_filter",
+        {},
+    )
+    camera_fov_filter_enabled = bool(
+        camera_fov_filter_cfg.get(
+            "enabled",
+            True,
+        )
+    )
+    camera_near_clip_m = float(
+        camera_fov_filter_cfg.get(
+            "near_clip_m",
+            ann_cfg.get("bbox2d", {}).get(
+                "near_clip_m",
+                0.05,
+            ),
+        )
+    )
+
+    camera_projected_bbox = None
+
+    if camera_fov_filter_enabled:
+        camera_projected_bbox = projected_bbox_from_corners(
+            corners_camera_cv,
+            K,
+            image_width,
+            image_height,
+            near_clip_m=camera_near_clip_m,
+        )
+
+        if camera_projected_bbox is None:
+            return None, "outside_camera_fov"
+
     ########################## LiDAR 可见性：静态地图对象同样使用真实点云硬筛选 ################################
 
     lidar_visibility_cfg = ann_cfg.get(
@@ -2898,20 +2965,23 @@ def build_environment_object_annotation(
             "projected",
             True,
         ):
+            if camera_projected_bbox is None:
+                camera_projected_bbox = projected_bbox_from_corners(
+                    corners_camera_cv,
+                    K,
+                    image_width,
+                    image_height,
+                    near_clip_m=float(
+                        bbox2d_cfg.get(
+                            "near_clip_m",
+                            0.05,
+                        )
+                    ),
+                )
+
             bbox2d[
                 "projected"
-            ] = projected_bbox_from_corners(
-                corners_camera_cv,
-                K,
-                image_width,
-                image_height,
-                near_clip_m=float(
-                    bbox2d_cfg.get(
-                        "near_clip_m",
-                        0.05,
-                    )
-                ),
-            )
+            ] = camera_projected_bbox
 
         object_data[
             "bbox2d"
@@ -2987,6 +3057,7 @@ def build_frame_annotations(
         "saved_static_objects": 0,
         "saved_objects": 0,
         "filtered_outside_lidar_fov": 0,
+        "filtered_outside_camera_fov": 0,
         "filtered_outside_annotation_distance": 0,
         "filtered_insufficient_lidar_points": 0,
         "filtered_insufficient_rgb_visible_pixels": 0,
@@ -3073,6 +3144,14 @@ def build_frame_annotations(
         ):
             stats[
                 "filtered_outside_lidar_fov"
+            ] += 1
+
+        elif (
+            reject_reason
+            == "outside_camera_fov"
+        ):
+            stats[
+                "filtered_outside_camera_fov"
             ] += 1
 
         elif (
@@ -3176,6 +3255,14 @@ def build_frame_annotations(
         ):
             stats[
                 "filtered_outside_lidar_fov"
+            ] += 1
+
+        elif (
+            reject_reason
+            == "outside_camera_fov"
+        ):
+            stats[
+                "filtered_outside_camera_fov"
             ] += 1
 
         elif (
@@ -3520,7 +3607,7 @@ def main():
     # )
 
     # 指定数据集名称
-    scene_name = "Town01_Opt"
+    scene_name = "Town05_Opt"
 
     scene_dir = output_root / scene_name
     rgb_dir = scene_dir / "rgb"
@@ -4368,6 +4455,7 @@ def main():
                 "saved_static_objects": 0,
                 "saved_objects": 0,
                 "filtered_outside_lidar_fov": 0,
+                "filtered_outside_camera_fov": 0,
                 "filtered_outside_annotation_distance": 0,
                 "filtered_insufficient_lidar_points": 0,
                 "filtered_insufficient_rgb_visible_pixels": 0,
@@ -4517,6 +4605,8 @@ def main():
                 f"static={annotation_stats['saved_static_objects']} "
                 f"fov_drop="
                 f"{annotation_stats['filtered_outside_lidar_fov']} "
+                f"camera_drop="
+                f"{annotation_stats['filtered_outside_camera_fov']} "
                 f"lidar_drop="
                 f"{annotation_stats['filtered_insufficient_lidar_points']} "
                 f"rgb_drop="
