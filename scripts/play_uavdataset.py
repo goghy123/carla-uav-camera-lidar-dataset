@@ -20,15 +20,6 @@ from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import QMainWindow
 
 
-# python scripts/play_uavdataset.py `
-#     --scene dataset\Town05_Opt `
-#     --fps 15 `
-#     --range 80 `
-#     --max-points 0 `
-#     --prefetch 12 `
-#     --io-workers 2
-
-
 ########################## 项目设置：定义数据集目录和共享设置 ################################
 
 SCRIPT_DIR = Path(__file__).resolve().parent

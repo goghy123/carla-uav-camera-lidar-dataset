@@ -1,10 +1,3 @@
-
-# python .\scripts\play_uav_test_results.py `
-#     --scene .\dataset\Town07_Opt `
-#     --pred-dir .\test_predictions `
-#     --mode both `
-#     --score-threshold 0.1
-
 from pathlib import Path
 from dataclasses import dataclass
 import argparse
