@@ -1,0 +1,15 @@
+# CARLA Python API; the server and client should use the same release.
+carla==0.9.16
+
+# Data collection and playback
+numpy
+ruamel.yaml
+pillow
+opencv-python
+
+# VisPy + Qt6 playback windows
+vispy
+PyQt6
+
+# Optional utility: scripts/bin_check.py
+mayavi
