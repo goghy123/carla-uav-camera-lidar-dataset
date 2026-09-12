@@ -143,6 +143,35 @@ def validate_args(args):
     args.classes = normalize_classes(args.classes)
 
 
+def raw_lidar_to_display(points):
+    """
+    Convert CARLA/UE raw LiDAR coordinates to the right-handed coordinates
+    used only by the VisPy 3D display.
+
+    Raw CARLA/UE LiDAR:
+        x forward, y right, z up  (left-handed)
+
+    Display:
+        x forward, y left,  z up  (right-handed)
+
+    IMPORTANT:
+        Use this only for 3D visualization. Camera projection/calibration
+        must continue to use the original raw LiDAR coordinates.
+    """
+    display = np.asarray(
+        points,
+        dtype=np.float32,
+    ).copy()
+
+    if display.size:
+        display[..., 1] *= -1.0
+
+    return np.ascontiguousarray(
+        display,
+        dtype=np.float32,
+    )
+
+
 def load_json(path):
     with Path(path).open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -461,7 +490,8 @@ def build_gt_overlays(label_data, K, width, height, selected_classes, min_lidar_
         corners_lidar = bbox3d.get("lidar", {}).get("corners_xyz_m")
         if corners_lidar is not None:
             if bbox_intersects_display_cube(corners_lidar, visual_range):
-                lidar3d_lists[cls].append(lidar_cuboid_segments(corners_lidar)); in_range += 1
+                corners_display = raw_lidar_to_display(corners_lidar)
+                lidar3d_lists[cls].append(lidar_cuboid_segments(corners_display)); in_range += 1
             else:
                 outside += 1
         anchor_segments = concatenate_segments([current_projected, rgb_segments], 2)
@@ -509,7 +539,8 @@ def build_pred_overlays(prediction_data, height_m, K, T_camera_cv_from_lidar, wi
             text_pos[cls].append(np.min(box2d_segments, axis=0))
             texts[cls].append("P {} {:.2f}".format(cls, score))
         if bbox_intersects_display_cube(corners_lidar, visual_range):
-            lidar3d_lists[cls].append(lidar_cuboid_segments(corners_lidar, edges=MMDET_BBOX_EDGES)); in_range += 1
+            corners_display = raw_lidar_to_display(corners_lidar)
+            lidar3d_lists[cls].append(lidar_cuboid_segments(corners_display, edges=MMDET_BBOX_EDGES)); in_range += 1
         else:
             outside += 1
         kept += 1
@@ -555,7 +586,13 @@ def load_frame_data(frame, args, color_lut, K, T_camera_cv_from_lidar, altitude_
     visible_count = len(xyz)
     xyz = np.ascontiguousarray(display_sample(xyz, args.max_points), dtype=np.float32)
     height_colors = make_height_colors(xyz, args.range, color_lut)
+
+    # Keep the original CARLA/UE LiDAR coordinates for camera projection.
     rgb_colors = rgb_colorize_lidar_points(xyz, rgb, K, T_camera_cv_from_lidar)
+
+    # Convert only the geometry passed to the VisPy 3D viewer.
+    xyz = raw_lidar_to_display(xyz)
+
     image_height, image_width = rgb.shape[:2]
 
     gt = build_gt_overlays(
@@ -917,7 +954,10 @@ def main():
     frames=resolve_test_frames(scene_dir, pred_dir)
     if args.start>=len(frames): raise ValueError("--start {} is outside {} test frames".format(args.start, len(frames)))
     frames=frames[args.start:]
-    frustum=camera_frustum_segments_lidar(K,T,width,height,args.frustum_depth)
+    # Keep calibration geometry in raw LiDAR coordinates, then convert
+    # only the copy that is rendered in the right-hand 3D viewer.
+    frustum_raw=camera_frustum_segments_lidar(K,T,width,height,args.frustum_depth)
+    frustum=raw_lidar_to_display(frustum_raw)
     print()
     print("=" * 78)
     print("UAV BEVFusion 测试结果播放器（Windows）")

@@ -433,6 +433,35 @@ def load_lidar(path):
     return cloud.reshape(-1, 4)
 
 
+def raw_lidar_to_display(points):
+    """
+    Convert CARLA/UE raw LiDAR coordinates to the right-handed coordinates
+    used only by the VisPy 3D display.
+
+    Raw CARLA/UE LiDAR:
+        x forward, y right, z up  (left-handed)
+
+    Display:
+        x forward, y left,  z up  (right-handed)
+
+    IMPORTANT:
+        Use this only for 3D visualization. Camera projection/calibration
+        must continue to use the original raw LiDAR coordinates.
+    """
+    display = np.asarray(
+        points,
+        dtype=np.float32,
+    ).copy()
+
+    if display.size:
+        display[..., 1] *= -1.0
+
+    return np.ascontiguousarray(
+        display,
+        dtype=np.float32,
+    )
+
+
 def load_json(path):
     with open(
         path,
@@ -1494,9 +1523,17 @@ def build_overlays(
                 corners_lidar,
                 visual_range,
             ):
+                # The stored box corners are in raw CARLA/UE LiDAR
+                # coordinates. Convert only the 3D visualization copy.
+                corners_display = (
+                    raw_lidar_to_display(
+                        corners_lidar
+                    )
+                )
+
                 segments = (
                     lidar_cuboid_segments(
-                        corners_lidar
+                        corners_display
                     )
                 )
 
@@ -1723,6 +1760,8 @@ def load_frame_data(
         )
     )
 
+    # Camera projection must use the original CARLA/UE raw LiDAR
+    # coordinates (x forward, y right, z up).
     rgb_colors = (
         rgb_colorize_lidar_points(
             xyz,
@@ -1730,6 +1769,12 @@ def load_frame_data(
             K,
             T_camera_cv_from_lidar,
         )
+    )
+
+    # Only the right-hand 3D viewer uses a right-handed display
+    # coordinate system (x forward, y left, z up).
+    xyz = raw_lidar_to_display(
+        xyz
     )
 
     ########################## 标签：绘制目标类别和编号 ################################
@@ -3218,7 +3263,9 @@ def main():
         args.start:
     ]
 
-    frustum = (
+    # Build the frustum in raw LiDAR coordinates first so calibration
+    # math remains untouched, then convert only its displayed geometry.
+    frustum_raw = (
         camera_frustum_segments_lidar(
             K=K,
             T_camera_cv_from_lidar=(
@@ -3228,6 +3275,10 @@ def main():
             image_height=image_height,
             depth=args.frustum_depth,
         )
+    )
+
+    frustum = raw_lidar_to_display(
+        frustum_raw
     )
 
     print()
