@@ -11,6 +11,7 @@ from pathlib import Path
 from ruamel.yaml import YAML
 
 from carla_route_planner import GlobalRoutePlanner
+from uav_motion import altitude_above_road_at_distance
 
 
 ########################## 路径：定义项目根目录和配置文件位置 ################################
@@ -267,13 +268,35 @@ def decimate_polyline(points, min_spacing_m):
 ########################## 路线绘制：地面 Anchor + 空中 UAV 实际轨迹 ################################
 
 
-def draw_route(world, anchors, planned_path, altitude_m, life_time=1.0):
+def draw_route(
+    world,
+    anchors,
+    planned_path,
+    speed_mps,
+    altitude_config,
+    hover_config,
+    life_time=1.0,
+):
     debug = world.debug
 
     anchor_color = carla.Color(0, 255, 0)
     route_color = carla.Color(0, 180, 255)
     text_color = carla.Color(255, 255, 255)
     arrow_color = carla.Color(255, 180, 0)
+    hover_color = carla.Color(255, 0, 255)
+
+    altitude_min = float(altitude_config["min_above_road_m"])
+    altitude_max = float(altitude_config["max_above_road_m"])
+    altitude_cycle = float(altitude_config["cycle_motion_seconds"])
+
+    def flight_altitude(distance_m):
+        return altitude_above_road_at_distance(
+            distance_m,
+            speed_mps,
+            altitude_min,
+            altitude_max,
+            altitude_cycle,
+        )
 
     for i, anchor in enumerate(anchors):
         ground_location = make_location(anchor, z_offset=0.35)
@@ -303,10 +326,23 @@ def draw_route(world, anchors, planned_path, altitude_m, life_time=1.0):
     # The saved path remains dense (normally 0.5 m). Only the debug drawing is
     # decimated so long routes do not flood CARLA with thousands of draw calls.
     display_path = decimate_polyline(planned_path, min_spacing_m=2.0)
+    display_distances = [0.0]
 
     for i in range(len(display_path) - 1):
-        start = make_location(display_path[i], z_offset=altitude_m)
-        end = make_location(display_path[i + 1], z_offset=altitude_m)
+        display_distances.append(
+            display_distances[-1]
+            + xy_distance(display_path[i], display_path[i + 1])
+        )
+
+    for i in range(len(display_path) - 1):
+        start = make_location(
+            display_path[i],
+            z_offset=flight_altitude(display_distances[i]),
+        )
+        end = make_location(
+            display_path[i + 1],
+            z_offset=flight_altitude(display_distances[i + 1]),
+        )
 
         debug.draw_line(
             start,
@@ -325,8 +361,14 @@ def draw_route(world, anchors, planned_path, altitude_m, life_time=1.0):
         if distance_since_arrow < 20.0:
             continue
 
-        start = make_location(display_path[i], z_offset=altitude_m)
-        end = make_location(display_path[i + 1], z_offset=altitude_m)
+        start = make_location(
+            display_path[i],
+            z_offset=flight_altitude(display_distances[i]),
+        )
+        end = make_location(
+            display_path[i + 1],
+            z_offset=flight_altitude(display_distances[i + 1]),
+        )
 
         debug.draw_arrow(
             start,
@@ -338,6 +380,58 @@ def draw_route(world, anchors, planned_path, altitude_m, life_time=1.0):
         )
         distance_since_arrow = 0.0
 
+    if float(hover_config["duration_seconds"]) <= 0.0:
+        return
+
+    hover_spacing_m = float(speed_mps) * float(
+        hover_config["after_motion_seconds"]
+    )
+    next_hover_distance = hover_spacing_m
+    route_distance = 0.0
+    total_route_distance = polyline_xy_length(planned_path)
+    hover_index = 1
+
+    for i in range(len(planned_path) - 1):
+        segment_length = xy_distance(planned_path[i], planned_path[i + 1])
+        segment_end_distance = route_distance + segment_length
+
+        while (
+            segment_length > 1e-9
+            and next_hover_distance < total_route_distance - 1e-6
+            and next_hover_distance <= segment_end_distance
+        ):
+            ratio = (next_hover_distance - route_distance) / segment_length
+            hover_point = {
+                axis: float(planned_path[i][axis])
+                + ratio
+                * (
+                    float(planned_path[i + 1][axis])
+                    - float(planned_path[i][axis])
+                )
+                for axis in ("x", "y", "z")
+            }
+            hover_location = make_location(
+                hover_point,
+                z_offset=flight_altitude(next_hover_distance),
+            )
+            debug.draw_point(
+                hover_location,
+                size=0.35,
+                color=hover_color,
+                life_time=life_time,
+            )
+            debug.draw_string(
+                hover_location,
+                f"H{hover_index:02d}",
+                draw_shadow=True,
+                color=hover_color,
+                life_time=life_time,
+            )
+            hover_index += 1
+            next_hover_distance += hover_spacing_m
+
+        route_distance = segment_end_distance
+
 
 ########################## 打印路线：输出锚点、规划点数和路线长度 ################################
 
@@ -347,7 +441,9 @@ def print_route(
     route_map,
     anchors,
     planned_path,
-    altitude_m,
+    speed_mps,
+    altitude_config,
+    hover_config,
     sampling_resolution,
     lookahead_m,
 ):
@@ -358,7 +454,21 @@ def print_route(
     print("Planned path points:", len(planned_path))
     print("Planned XY length:", f"{polyline_xy_length(planned_path):.3f} m")
     print("Planner resolution:", f"{sampling_resolution:.3f} m")
-    print("UAV altitude above road:", f"{altitude_m:.3f} m")
+    print(
+        "UAV altitude above road:",
+        f"{float(altitude_config['min_above_road_m']):.3f} .. "
+        f"{float(altitude_config['max_above_road_m']):.3f} m",
+    )
+    print(
+        "Altitude cycle:",
+        f"{float(altitude_config['cycle_motion_seconds']):.3f} moving s",
+    )
+    print(
+        "Hover:",
+        f"every {float(hover_config['after_motion_seconds']):.3f} moving s "
+        f"for {float(hover_config['duration_seconds']):.3f} s",
+    )
+    print("UAV speed:", f"{speed_mps:.3f} m/s")
     print("Heading lookahead:", f"{lookahead_m:.3f} m")
     print("============================================")
 
@@ -624,7 +734,9 @@ def print_editor_help(
     route_path,
     current_map_name,
     sampling_resolution,
-    altitude_m,
+    speed_mps,
+    altitude_config,
+    hover_config,
     lookahead_m,
     anchors,
     planned_path,
@@ -637,7 +749,21 @@ def print_editor_help(
     print(route_path)
     print("当前 CARLA 地图:", current_map_name)
     print("规划采样间距:", f"{sampling_resolution:.3f} m")
-    print("UAV 高度:", f"road_z + {altitude_m:.3f} m")
+    print(
+        "UAV 高度:",
+        f"road_z + {float(altitude_config['min_above_road_m']):.3f} .. "
+        f"{float(altitude_config['max_above_road_m']):.3f} m",
+    )
+    print(
+        "高度周期:",
+        f"{float(altitude_config['cycle_motion_seconds']):.3f} s（仅累计前进时间）",
+    )
+    print(
+        "悬停:",
+        f"每前进 {float(hover_config['after_motion_seconds']):.3f} s，"
+        f"悬停 {float(hover_config['duration_seconds']):.3f} s",
+    )
+    print("巡航速度:", f"{speed_mps:.3f} m/s")
     print("朝向前视距离:", f"{lookahead_m:.3f} m")
     print()
     print("在 CARLA 窗口移动 Spectator 到目标道路附近，然后切回终端按键：")
@@ -656,6 +782,7 @@ def print_editor_help(
     print("绿色 Axx = 地面道路 Anchor")
     print("蓝色线    = 实际 UAV 路径（road_z + altitude）")
     print("橙色箭头  = 飞行方向")
+    print("紫色 Hxx  = 悬停位置")
     print()
     print("当前 Anchor 数量:", len(anchors))
     print("当前 planned_path 点数:", len(planned_path))
@@ -713,12 +840,23 @@ def main():
     uav_cfg = config["uav"]
     planner_cfg = config["route_planner"]
 
-    altitude_m = float(uav_cfg["altitude_above_road_m"])
+    speed_mps = float(uav_cfg["speed_mps"])
+    altitude_config = uav_cfg["altitude"]
+    hover_config = uav_cfg["hover"]
     sampling_resolution = float(planner_cfg["sampling_resolution_m"])
     lookahead_m = float(uav_cfg["heading_lookahead_m"])
 
-    if altitude_m <= 0:
-        raise ValueError("uav.altitude_above_road_m 必须 > 0")
+    if speed_mps <= 0:
+        raise ValueError("uav.speed_mps 必须 > 0")
+    altitude_min = float(altitude_config["min_above_road_m"])
+    altitude_max = float(altitude_config["max_above_road_m"])
+    altitude_cycle = float(altitude_config["cycle_motion_seconds"])
+    if altitude_min <= 0 or altitude_max < altitude_min or altitude_cycle <= 0:
+        raise ValueError("uav.altitude 配置无效")
+    if float(hover_config["after_motion_seconds"]) <= 0:
+        raise ValueError("uav.hover.after_motion_seconds 必须 > 0")
+    if float(hover_config["duration_seconds"]) < 0:
+        raise ValueError("uav.hover.duration_seconds 必须 >= 0")
     if sampling_resolution <= 0:
         raise ValueError("route_planner.sampling_resolution_m 必须 > 0")
     if lookahead_m <= 0:
@@ -815,7 +953,9 @@ def main():
         route_path,
         current_map_name,
         sampling_resolution,
-        altitude_m,
+        speed_mps,
+        altitude_config,
+        hover_config,
         lookahead_m,
         anchors,
         planned_path,
@@ -832,7 +972,9 @@ def main():
                 world,
                 anchors,
                 planned_path,
-                altitude_m=altitude_m,
+                speed_mps=speed_mps,
+                altitude_config=altitude_config,
+                hover_config=hover_config,
                 life_time=0.9,
             )
             last_draw_time = current_time
@@ -940,7 +1082,9 @@ def main():
                 current_map_name,
                 anchors,
                 planned_path,
-                altitude_m,
+                speed_mps,
+                altitude_config,
+                hover_config,
                 sampling_resolution,
                 lookahead_m,
             )

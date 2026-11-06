@@ -5,7 +5,7 @@
 |![demo](assets/demo3.gif)|![demo](assets/demo4.gif)|
 
 ## 简介
-这是一个基于 [CARLA](https://carla.org/) (v0.9.16)的无人机视角多传感器数据集录制与回放工具。项目让 UAV 沿 CARLA 道路规划路线飞行，在固定高度采集同步的 RGB 图像、LiDAR 点云、位姿和目标标注，用于无人机视角下的 3D 检测、点云可视化和模型结果检查。
+这是一个基于 [CARLA](https://carla.org/) (v0.9.16)的无人机视角多传感器数据集录制与回放工具。项目让 UAV 沿 CARLA 道路规划路线飞行，以可配置的平滑高度变化和周期悬停采集同步的 RGB 图像、LiDAR 点云、位姿和目标标注，用于无人机视角下的 3D 检测、点云可视化和模型结果检查。
 
 开发者可以使用路线编辑器配置飞行路线，使用采集器生成场景数据，使用播放器检查 RGB、LiDAR 和标注，并将检测模型的预测结果与真实标注叠加查看。
 
@@ -14,12 +14,15 @@
 ### 主要功能
 
 - 在 CARLA 中编辑并保存 UAV 路线。
+- 支持 20–50 m 平滑变高度飞行、周期悬停和一键录制全部路线。
 - 按统一采集频率（10 Hz）同步采集 RGB、128 线 LiDAR、UAV 位姿和 2D/3D 标注。
 - 支持车辆、卡车、公交车等类别，并保存世界坐标、LiDAR 坐标和相机坐标下的 3D 框。
 - 数据集回放：左侧显示 RGB，右侧显示可旋转的 LiDAR 点云、相机视锥和标注框。
 - 回放 ground truth 与外部检测模型预测结果，支持 `gt`、`pred` 和 `both` 三种模式。
 
 ### 数据集规模
+
+以下统计对应原固定 50 m 高度版本；`dataset_v2` 采用变高度与悬停策略，重新录制后的帧数和类别分布会变化。
 
 数据集覆盖 8 个 CARLA Town 场景，共包含 **29,505 帧**，约 **49.18 分钟**的飞行数据，累计路线长度约 **23.59 km**，磁盘占用约 **57.69 GiB**，共 **217,871 个目标标注**。
 
@@ -55,10 +58,10 @@
 
 ### 数据组织
 
-数据按照 CARLA 场景分别存放在 `dataset/<scene>/` 中。RGB 图像、LiDAR 点云、位姿和标注使用相同的六位帧编号一一对应；每个场景同时保存采集元数据和相机-LiDAR 标定信息。
+数据按照 CARLA 场景分别存放在 `<output.root>/<scene>/` 中；当前新版本默认根目录为 `dataset_v2`。RGB 图像、LiDAR 点云、位姿和标注使用相同的六位帧编号一一对应；每个场景同时保存采集元数据和相机-LiDAR 标定信息。
 
 ```text
-dataset/
+dataset_v2/
 ├─ Town01_Opt/
 │  ├─ calibration.json
 │  ├─ metadata.json
@@ -96,6 +99,11 @@ dataset/
 - `calibration.json`：相机内参、相机-LiDAR 外参及坐标系定义。
 - `metadata.json`：场景、路线、采样频率、交通和标注配置等采集元数据。
 
+变高度悬停版本在每个 `pose/*.json` 中额外保存
+`motion_time_s`、`is_hovering`、`hover_index`、`road_z_m`、
+`altitude_above_road_m` 和 `uav_effective_speed_mps`。`metadata.json` 与
+`calibration.json` 同时保存完整高度曲线和悬停策略；RGB、LiDAR 与标签文件格式不变。
+
 ## 安装部署
 
 推荐使用 conda 管理 Python 依赖。使用以下指令创建名为`carla`的`conda`虚拟环境并激活:
@@ -129,11 +137,7 @@ conda activate carla
 
 - `configs\routes`：文件夹下存放着carla不同地图对应录制好的路线，以对应的地图名命名。
 
-> `configs/UAVdataset.yaml`中数据集输出默认在`dataset`文件夹下。项目根目录下打开终端，使用以下指令创建数据集存放文件夹
-
-```powershell
-mkdir dataset
-```
+> 新版本默认输出到 `dataset_v2/<route.name>/`。目标场景目录非空时采集器会拒绝启动，避免新旧录制混写。
 
 ### 采集路线编辑
 
@@ -168,9 +172,23 @@ python scripts/route_editor.py
 python scripts/collect_uavdataset.py
 ```
 
-采集器会自动加载地图路线文件对应的地图，并等待15s热身交通。录制的文件名默认按照"scene_"+"时间"组合，也可在`scripts\collect_uavdataset.py`中，修改`scene_name`以指定数据集名称。
+采集器会自动加载路线对应地图，等待 60 s 热身交通，再按照配置的 20–50 m 余弦高度曲线飞行。每累计前进 30 s 悬停 3 s；悬停期间 UAV 位置、高度和航向保持不变，交通继续运动。输出场景名直接使用路线的 `route.name`。
 
-> 当前名称为指定名称：`Town05_Opt`。
+动态交通中的 Bus 蓝图抽样权重默认为 `1.5`，即相对其他车辆蓝图提高 50% 的期望抽样概率；车辆总数保持不变，实际数量仍受地图出生点和生成失败影响。
+
+#### 一键录制全部路线
+
+保持 CARLA 服务端持续运行，在项目根目录执行：
+
+```powershell
+python scripts/collect_all_routes.py
+```
+
+脚本会按文件名顺序扫描 `configs/routes/*.yaml`，依次自动加载地图并录制到
+`dataset_v2/<route.name>/`，不修改 `UAVdataset.yaml` 当前选择的路线。开始前会统一检查
+所有目标场景目录；只要有一个目录非空，整批任务就不会启动。
+
+仍可通过修改 `uav.route_file` 后运行 `python scripts/collect_uavdataset.py`，只录制单条路线。
 
 ### 数据集回放
 
@@ -178,7 +196,7 @@ python scripts/collect_uavdataset.py
 
 ```powershell
 python scripts/play_uavdataset.py `
-    --scene dataset\Town06_Opt `
+    --scene dataset_v2\Town06_Opt `
     --fps 15 `
     --range 80 `
     --max-points 0 `
@@ -245,8 +263,8 @@ test_predictions/
 
 ```powershell
 python .\scripts\play_uav_test_results.py `
-    --scene .\dataset\Town07_Opt `
-    --pred-dir .\dataset\test_predictions `
+    --scene .\dataset_v2\Town07_Opt `
+    --pred-dir .\dataset_v2\test_predictions `
     --mode both `
     --score-threshold 0.1
 ```
@@ -255,7 +273,7 @@ python .\scripts\play_uav_test_results.py `
 
 ```powershell
 python .\scripts\play_uav_test_results.py `
-    --scene .\dataset\Town07_Opt `
+    --scene .\dataset_v2\Town07_Opt `
     --pred-dir .\results\test_predictions `
     --mode pred `
     --score-threshold 0.3
@@ -265,7 +283,7 @@ python .\scripts\play_uav_test_results.py `
 
 ```powershell
 python .\scripts\play_uav_test_results.py `
-    --scene .\dataset\Town07_Opt `
+    --scene .\dataset_v2\Town07_Opt `
     --pred-dir .\results\test_predictions `
     --mode gt
 ```

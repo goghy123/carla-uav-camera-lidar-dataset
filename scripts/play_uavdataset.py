@@ -333,11 +333,13 @@ def find_frames(scene_dir):
     rgb_dir = scene_dir / "rgb"
     lidar_dir = scene_dir / "lidar"
     label_dir = scene_dir / "labels"
+    pose_dir = scene_dir / "pose"
 
     for path, name in (
         (rgb_dir, "rgb"),
         (lidar_dir, "lidar"),
         (label_dir, "labels"),
+        (pose_dir, "pose"),
     ):
         if not path.exists():
             raise FileNotFoundError(
@@ -359,10 +361,16 @@ def find_frames(scene_dir):
         for p in label_dir.glob("*.json")
     }
 
+    poses = {
+        p.stem: p
+        for p in pose_dir.glob("*.json")
+    }
+
     common = (
         set(rgb)
         & set(lidar)
         & set(labels)
+        & set(poses)
     )
 
     if not common:
@@ -385,14 +393,16 @@ def find_frames(scene_dir):
         len(rgb)
         == len(lidar)
         == len(labels)
+        == len(poses)
         == len(common)
     ):
         print(
-            "WARNING: RGB/LiDAR/labels counts are not identical."
+            "WARNING: RGB/LiDAR/labels/pose counts are not identical."
         )
         print("  RGB         :", len(rgb))
         print("  LiDAR       :", len(lidar))
         print("  labels      :", len(labels))
+        print("  pose        :", len(poses))
         print("  synchronized:", len(common))
 
     return [
@@ -401,6 +411,7 @@ def find_frames(scene_dir):
             "rgb": rgb[frame_id],
             "lidar": lidar[frame_id],
             "label": labels[frame_id],
+            "pose": poses[frame_id],
         }
         for frame_id in ids
     ]
@@ -1679,6 +1690,10 @@ class FrameData:
 
     stats: dict
 
+    altitude_above_road_m: float | None
+    is_hovering: bool
+    motion_time_s: float | None
+
 
 def load_frame_data(
     frame,
@@ -1701,6 +1716,10 @@ def load_frame_data(
 
     label = load_json(
         frame["label"]
+    )
+
+    pose = load_json(
+        frame["pose"]
     )
 
     original_count = len(
@@ -1816,6 +1835,9 @@ def load_frame_data(
         text=text,
         text_pos=text_pos,
         stats=stats,
+        altitude_above_road_m=pose.get("altitude_above_road_m"),
+        is_hovering=bool(pose.get("is_hovering", False)),
+        motion_time_s=pose.get("motion_time_s"),
     )
 
 
@@ -2883,6 +2905,12 @@ class DatasetPlayerWindow(
         else:
             state = "PLAYING"
 
+        altitude_text = (
+            f" | altitude {self.current_data.altitude_above_road_m:.1f}m"
+            if self.current_data.altitude_above_road_m is not None
+            else ""
+        )
+
         self.status_label.text = (
             f"{self.current_index + 1}/"
             f"{len(self.frames)}"
@@ -2893,6 +2921,8 @@ class DatasetPlayerWindow(
             f" | submit {self.last_submit_ms:.2f} ms"
             f" | minPts {self.args.min_lidar_points}"
             f" | range ±{self.args.range:.0f}m"
+            f" | flight={'HOVER' if self.current_data.is_hovering else 'MOVE'}"
+            f"{altitude_text}"
             f" | B 2D | C RGB-3D | L LiDAR-3D"
             f" | P point-color | F frustum | T text"
         )

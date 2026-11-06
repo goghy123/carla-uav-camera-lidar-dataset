@@ -6,11 +6,17 @@ import queue
 import random
 import time
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from ruamel.yaml import YAML
+
+from uav_motion import (
+    altitude_above_road_at_distance,
+    is_hovering_at_frame as profile_is_hovering_at_frame,
+    motion_intervals_at_frame,
+    required_frames as profile_required_frames,
+)
 
 try:
     import cv2
@@ -117,10 +123,10 @@ def validate_route_schema(route_root, route_path):
     return route
 
 
-def load_config():
+def load_config(route_file_override=None):
     config = load_yaml(CONFIG_PATH)
 
-    route_file = config["uav"]["route_file"]
+    route_file = route_file_override or config["uav"]["route_file"]
     route_path = (CONFIG_PATH.parent / route_file).resolve()
 
     if not route_path.exists():
@@ -160,6 +166,24 @@ def validate_config(config):
     if speed <= 0:
         raise ValueError("uav.speed_mps must be > 0")
 
+    altitude_cfg = config["uav"]["altitude"]
+    altitude_min = float(altitude_cfg["min_above_road_m"])
+    altitude_max = float(altitude_cfg["max_above_road_m"])
+    altitude_cycle = float(altitude_cfg["cycle_motion_seconds"])
+
+    if altitude_min <= 0 or altitude_max < altitude_min:
+        raise ValueError(
+            "uav.altitude must satisfy 0 < min_above_road_m <= max_above_road_m"
+        )
+    if altitude_cycle <= 0:
+        raise ValueError("uav.altitude.cycle_motion_seconds must be > 0")
+
+    hover_cfg = config["uav"]["hover"]
+    if float(hover_cfg["after_motion_seconds"]) <= 0:
+        raise ValueError("uav.hover.after_motion_seconds must be > 0")
+    if float(hover_cfg["duration_seconds"]) < 0:
+        raise ValueError("uav.hover.duration_seconds must be >= 0")
+
     lidar_cfg = config["sensors"]["lidar"]
     if float(lidar_cfg["points_per_second"]) <= 0:
         raise ValueError("lidar.points_per_second must be > 0")
@@ -190,6 +214,9 @@ def validate_config(config):
 
     if float(traffic_cfg.get("warmup_seconds", 0.0)) < 0:
         raise ValueError("traffic.warmup_seconds must be >= 0")
+
+    if float(traffic_cfg.get("bus_spawn_weight", 1.0)) <= 0:
+        raise ValueError("traffic.bus_spawn_weight must be > 0")
 
     ann_cfg = config.get("annotations", {})
     if ann_cfg.get("enabled", False):
@@ -478,14 +505,34 @@ class UAVRoute:
         self.name = str(route["name"])
         self.map_name = str(route["map"])
 
-        self.altitude_m = float(
-            uav_config["altitude_above_road_m"]
+        altitude_config = uav_config["altitude"]
+        self.altitude_min_m = float(
+            altitude_config["min_above_road_m"]
+        )
+        self.altitude_max_m = float(
+            altitude_config["max_above_road_m"]
+        )
+        self.altitude_cycle_motion_seconds = float(
+            altitude_config["cycle_motion_seconds"]
         )
 
-        if self.altitude_m <= 0:
-            raise ValueError(
-                "uav.altitude_above_road_m must be > 0"
-            )
+        hover_config = uav_config["hover"]
+        self.hover_after_motion_seconds = float(
+            hover_config["after_motion_seconds"]
+        )
+        self.hover_duration_seconds = float(
+            hover_config["duration_seconds"]
+        )
+        self.move_frames = max(
+            1,
+            int(round(self.hover_after_motion_seconds * self.fps)),
+        )
+        self.hover_frames = max(
+            0,
+            int(round(self.hover_duration_seconds * self.fps)),
+        )
+        self.actual_hover_after_motion_seconds = self.move_frames / self.fps
+        self.actual_hover_duration_seconds = self.hover_frames / self.fps
 
         self.heading_lookahead_m = float(
             uav_config["heading_lookahead_m"]
@@ -618,18 +665,66 @@ class UAVRoute:
             )
 
     def required_frames(self):
+        return profile_required_frames(
+            self.total_length,
+            self.distance_per_frame,
+            self.move_frames,
+            self.hover_frames,
+        )
+
+    def hover_count(self):
         movement_intervals = math.ceil(
             self.total_length / self.distance_per_frame
         )
-        return movement_intervals + 1
+        return max(0, movement_intervals - 1) // self.move_frames
 
     def estimated_duration(self):
-        return self.total_length / self.speed
+        return (self.required_frames() - 1) / self.fps
 
     def distance_at_frame(self, frame_index):
+        movement_intervals = motion_intervals_at_frame(
+            frame_index,
+            self.move_frames,
+            self.hover_frames,
+        )
         return min(
-            float(frame_index) * self.distance_per_frame,
+            float(movement_intervals) * self.distance_per_frame,
             self.total_length,
+        )
+
+    def motion_time_at_frame(self, frame_index):
+        return (
+            motion_intervals_at_frame(
+                frame_index,
+                self.move_frames,
+                self.hover_frames,
+            )
+            / self.fps
+        )
+
+    def is_hovering_at_frame(self, frame_index):
+        return (
+            not self.is_finished(frame_index)
+            and profile_is_hovering_at_frame(
+                frame_index,
+                self.move_frames,
+                self.hover_frames,
+            )
+        )
+
+    def hover_index_at_frame(self, frame_index):
+        if not self.is_hovering_at_frame(frame_index):
+            return None
+        cycle_frames = self.move_frames + self.hover_frames
+        return int(frame_index) // cycle_frames + 1
+
+    def altitude_at_distance(self, distance):
+        return altitude_above_road_at_distance(
+            distance,
+            self.speed,
+            self.altitude_min_m,
+            self.altitude_max_m,
+            self.altitude_cycle_motion_seconds,
         )
 
     def is_finished(self, frame_index):
@@ -733,12 +828,13 @@ class UAVRoute:
     def pose_at_distance(self, distance):
         road_position = self.road_point_at_distance(distance)
         yaw = self.yaw_at_distance(distance)
+        altitude_m = self.altitude_at_distance(distance)
 
         return carla.Transform(
             carla.Location(
                 x=float(road_position[0]),
                 y=float(road_position[1]),
-                z=float(road_position[2] + self.altitude_m),
+                z=float(road_position[2] + altitude_m),
             ),
             carla.Rotation(
                 pitch=0.0,
@@ -775,14 +871,27 @@ def print_recording_plan(
 ):
     print()
     print("=" * 64)
-    print("UAV DATASET V3.3 RECORDING PLAN")
+    print("UAV DATASET V3.4 RECORDING PLAN")
     print("=" * 64)
 
     print(f"Route name             : {route.name}")
     print(f"Route map              : {route.map_name}")
     print(f"Planned path points    : {len(route.points)}")
     print(f"Route XY length        : {route.total_length:.3f} m")
-    print(f"UAV altitude / road    : {route.altitude_m:.3f} m")
+    print(
+        f"UAV altitude / road    : "
+        f"{route.altitude_min_m:.3f} .. {route.altitude_max_m:.3f} m"
+    )
+    print(
+        f"Altitude cycle         : "
+        f"{route.altitude_cycle_motion_seconds:.3f} moving s"
+    )
+    print(
+        f"Hover schedule         : every "
+        f"{route.actual_hover_after_motion_seconds:.3f} moving s for "
+        f"{route.actual_hover_duration_seconds:.3f} s"
+    )
+    print(f"Full-route hovers      : {route.hover_count()}")
     print(f"Planner resolution     : {route.planner_resolution_m:.3f} m")
     print(f"Max stored XY segment  : {route.max_segment_length_m:.3f} m")
     print(f"Heading lookahead      : {route.heading_lookahead_m:.3f} m")
@@ -793,7 +902,7 @@ def print_recording_plan(
         f"{route.distance_per_frame:.3f} m"
     )
     print(
-        f"Estimated flight time  : "
+        f"Estimated total time   : "
         f"{route.estimated_duration():.3f} s"
     )
     print(f"Full-route frames      : {route.required_frames()}")
@@ -809,14 +918,8 @@ def print_recording_plan(
     print(f"Actual frames          : {actual_num_frames}")
 
     if configured_num_frames > 0:
-        movement_distance = max(
-            configured_num_frames - 1,
-            0,
-        ) * route.distance_per_frame
-
-        coverage_distance = min(
-            movement_distance,
-            route.total_length,
+        coverage_distance = route.distance_at_frame(
+            max(configured_num_frames - 1, 0)
         )
 
         coverage_percent = (
@@ -850,6 +953,10 @@ def print_recording_plan(
     print(
         f"Traffic warmup         : "
         f"{traffic_cfg.get('warmup_seconds', 0.0)} s"
+    )
+    print(
+        f"Bus spawn weight       : "
+        f"{traffic_cfg.get('bus_spawn_weight', 1.0)}"
     )
 
     print()
@@ -1180,6 +1287,17 @@ def spawn_traffic(
             "No vehicle blueprints are available for configured classes."
         )
 
+    bus_spawn_weight = float(config.get("bus_spawn_weight", 1.0))
+    vehicle_bp_weights = [
+        bus_spawn_weight
+        if blueprint_base_type(bp) == "bus"
+        else 1.0
+        for bp in vehicle_bps
+    ]
+    bus_blueprint_count = sum(
+        1 for bp in vehicle_bps if blueprint_base_type(bp) == "bus"
+    )
+
     spawn_points = world.get_map().get_spawn_points()
     rng.shuffle(spawn_points)
 
@@ -1190,6 +1308,8 @@ def spawn_traffic(
     print("  requested vehicles :", requested_number)
     print("  available spawns   :", len(spawn_points))
     print("  spawn attempts     :", number)
+    print("  bus blueprints     :", bus_blueprint_count)
+    print("  bus spawn weight   :", bus_spawn_weight)
 
     if requested_number > len(spawn_points):
         print(
@@ -1201,7 +1321,11 @@ def spawn_traffic(
     batch = []
 
     for spawn in spawn_points[:number]:
-        bp = rng.choice(vehicle_bps)
+        bp = rng.choices(
+            vehicle_bps,
+            weights=vehicle_bp_weights,
+            k=1,
+        )[0]
 
         if bp.has_attribute("role_name"):
             bp.set_attribute("role_name", "autopilot")
@@ -1244,8 +1368,13 @@ def spawn_traffic(
         if actor is not None:
             vehicles.append(actor)
 
+    spawned_class_counts = defaultdict(int)
+    for vehicle in vehicles:
+        spawned_class_counts[classify_actor(vehicle) or "unknown"] += 1
+
     print("  successfully spawned:", len(vehicles))
     print("  failed              :", failed)
+    print("  spawned classes     :", dict(sorted(spawned_class_counts.items())))
 
     return vehicles
 
@@ -3507,8 +3636,8 @@ def prepare_world_for_route(
 
 ########################## 程序入口：读取配置并启动工具 ################################
 
-def main():
-    config = load_config()
+def main(route_file_override=None):
+    config = load_config(route_file_override)
     validate_config(config)
 
     sim_cfg = config["simulation"]
@@ -3606,13 +3735,7 @@ def main():
         / str(output_cfg["root"])
     )
 
-    # 默认数据集名称按照“scene_”+"时间"组合
-    # scene_name = datetime.now().strftime(
-    #     "scene_%Y%m%d_%H%M%S"
-    # )
-
-    # 指定数据集名称
-    scene_name = "Town05_Opt"
+    scene_name = route.name
 
     scene_dir = output_root / scene_name
     rgb_dir = scene_dir / "rgb"
@@ -3620,6 +3743,12 @@ def main():
     pose_dir = scene_dir / "pose"
     labels_dir = scene_dir / "labels"
     debug_dir = scene_dir / "debug_bbox"
+
+    if scene_dir.exists() and any(scene_dir.iterdir()):
+        raise FileExistsError(
+            "Dataset scene directory is not empty; refusing to mix recordings:\n"
+            f"{scene_dir}"
+        )
 
     scene_dir.mkdir(
         parents=True,
@@ -3974,6 +4103,27 @@ def main():
             @ T_camera_ue_lidar
         )
 
+        altitude_profile = {
+            "type": "cosine_by_motion_time",
+            "min_above_road_m": float(route.altitude_min_m),
+            "max_above_road_m": float(route.altitude_max_m),
+            "cycle_motion_seconds": float(
+                route.altitude_cycle_motion_seconds
+            ),
+            "starts_at": "max_above_road_m",
+            "frozen_during_hover": True,
+        }
+        hover_profile = {
+            "after_motion_seconds": float(
+                route.actual_hover_after_motion_seconds
+            ),
+            "duration_seconds": float(
+                route.actual_hover_duration_seconds
+            ),
+            "events_before_route_end": int(route.hover_count()),
+            "position_altitude_heading_frozen": True,
+        }
+
         calibration = {
             "carla_client_version": client_version,
             "carla_server_version": server_version,
@@ -3993,9 +4143,8 @@ def main():
             "max_planned_path_segment_m": float(
                 route.max_segment_length_m
             ),
-            "uav_altitude_above_road_m": float(
-                route.altitude_m
-            ),
+            "uav_altitude_profile": altitude_profile,
+            "uav_hover_profile": hover_profile,
             "heading_lookahead_m": float(
                 route.heading_lookahead_m
             ),
@@ -4068,7 +4217,7 @@ def main():
 
         metadata = {
             "scene_name": scene_name,
-            "collector_version": "uav_v3.3",
+            "collector_version": "uav_v3.4",
             "carla_client_version": client_version,
             "carla_server_version": server_version,
             "dataset_fps_hz": float(FPS),
@@ -4106,9 +4255,8 @@ def main():
             "max_planned_path_segment_m": float(
                 route.max_segment_length_m
             ),
-            "uav_altitude_above_road_m": float(
-                route.altitude_m
-            ),
+            "uav_altitude_profile": altitude_profile,
+            "uav_hover_profile": hover_profile,
             "heading_lookahead_m": float(
                 route.heading_lookahead_m
             ),
@@ -4132,12 +4280,34 @@ def main():
                 "pedestrians": int(
                     len(walkers)
                 ),
+                "vehicle_classes": dict(
+                    sorted(
+                        {
+                            vehicle_class: sum(
+                                1
+                                for vehicle in vehicles
+                                if classify_actor(vehicle) == vehicle_class
+                            )
+                            for vehicle_class in (
+                                "car",
+                                "van",
+                                "truck",
+                                "bus",
+                                "motorcycle",
+                                "bicycle",
+                            )
+                        }.items()
+                    )
+                ),
             },
             "traffic_warmup_seconds": float(
                 traffic_cfg.get(
                     "warmup_seconds",
                     0.0,
                 )
+            ),
+            "traffic_bus_spawn_weight": float(
+                traffic_cfg.get("bus_spawn_weight", 1.0)
             ),
             "static_environment": {
                 "enabled": bool(
@@ -4343,6 +4513,13 @@ def main():
                 route.distance_at_frame(i)
             )
 
+            motion_time = route.motion_time_at_frame(i)
+            is_hovering = route.is_hovering_at_frame(i)
+            hover_index = route.hover_index_at_frame(i)
+            altitude_above_road = route.altitude_at_distance(
+                route_distance
+            )
+
             route_progress = (
                 route_distance / route.total_length
             )
@@ -4545,6 +4722,22 @@ def main():
                 "uav_speed_mps": float(
                     route.speed
                 ),
+                "uav_effective_speed_mps": float(
+                    0.0 if is_hovering else route.speed
+                ),
+                "motion_time_s": float(motion_time),
+                "is_hovering": bool(is_hovering),
+                "hover_index": (
+                    int(hover_index)
+                    if hover_index is not None
+                    else None
+                ),
+                "road_z_m": float(
+                    uav_tf.location.z - altitude_above_road
+                ),
+                "altitude_above_road_m": float(
+                    altitude_above_road
+                ),
                 "route_distance_m": float(
                     route_distance
                 ),
@@ -4624,6 +4817,8 @@ def main():
                 f"{route.total_length:.1f}m "
                 f"progress="
                 f"{route_progress * 100.0:.1f}% "
+                f"state={'HOVER' if is_hovering else 'MOVE'} "
+                f"altitude={altitude_above_road:.1f}m "
                 f"UAV=("
                 f"{uav_tf.location.x:.1f}, "
                 f"{uav_tf.location.y:.1f}, "

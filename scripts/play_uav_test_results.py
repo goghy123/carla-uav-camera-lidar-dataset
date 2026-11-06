@@ -235,9 +235,18 @@ def resolve_test_frames(scene_dir, pred_dir):
     return frames
 
 
-def reference_height_m(pose, altitude_m):
+def reference_height_m(pose, fallback_altitude_m):
     uav_z = float(pose["uav"]["location"]["z"])
     lidar_z = float(pose["lidar"]["location"]["z"])
+    altitude_m = pose.get(
+        "altitude_above_road_m",
+        fallback_altitude_m,
+    )
+    if altitude_m is None:
+        raise KeyError(
+            "pose JSON 缺少 altitude_above_road_m，且 metadata.json "
+            "没有旧版固定高度字段。"
+        )
     route_ground_z = uav_z - float(altitude_m)
     return lidar_z - route_ground_z
 
@@ -944,12 +953,9 @@ def main():
     if not metadata_path.exists():
         raise FileNotFoundError("场景缺少 metadata.json: {}".format(metadata_path))
     metadata = load_json(metadata_path)
-    if "uav_altitude_above_road_m" not in metadata:
-        raise KeyError(
-            "metadata.json 缺少 uav_altitude_above_road_m；"
-            "无法把 BEVFusion ground-reference 预测框转换回 CARLA LiDAR 坐标。"
-        )
-    altitude_m = float(metadata["uav_altitude_above_road_m"])
+    altitude_m = metadata.get("uav_altitude_above_road_m")
+    if altitude_m is not None:
+        altitude_m = float(altitude_m)
     _,K,T,width,height=load_calibration(scene_dir)
     frames=resolve_test_frames(scene_dir, pred_dir)
     if args.start>=len(frames): raise ValueError("--start {} is outside {} test frames".format(args.start, len(frames)))

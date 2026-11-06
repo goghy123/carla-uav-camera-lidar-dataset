@@ -28,11 +28,15 @@ traffic:
 
   tm_port: 8000
 
-  warmup_seconds: 15.0
+  warmup_seconds: 60.0
   # 录制前先让车辆和行人散开，减少刚生成时的拥挤。
 
   pedestrian_speed_min_mps: 1.0
   pedestrian_speed_max_mps: 2.0
+
+  # Bus 蓝图相对其他车辆蓝图的抽样权重；1.5 表示期望抽样概率提高 50%。
+  # 车辆总数不变，实际生成数量仍会受地图出生点和生成失败影响。
+  bus_spawn_weight: 1.5
 
 
 ########################## UAV 设置：定义飞行参数和当前录制路线 ################################
@@ -41,8 +45,17 @@ uav:
   # 水平（XY）巡航速度。道路高程变化只影响 UAV 的 z，不改变 XY 速度定义。
   speed_mps: 8.0
 
-  # UAV 始终保持在 planned_path 道路原始 z 之上该高度。
-  altitude_above_road_m: 50.0
+  # UAV 相对 planned_path 道路原始 z 做平滑余弦高度变化。
+  # 周期只累计实际前进时间；悬停期间高度相位冻结。
+  altitude:
+    min_above_road_m: 20.0
+    max_above_road_m: 50.0
+    cycle_motion_seconds: 80.0
+
+  # 每累计前进 30 s 悬停 3 s；悬停时位置、高度和航向保持不变。
+  hover:
+    after_motion_seconds: 30.0
+    duration_seconds: 3.0
 
   # collector 使用最终路线前方指定距离的位置计算 yaw，使转弯朝向更平滑。
   heading_lookahead_m: 5.0
@@ -202,7 +215,8 @@ annotations:
 ########################## 输出：说明数据集目录和生成文件 ################################
 
 output:
-  root: dataset
+  # 新版本按 route.name 写入独立目录，例如 dataset_v2/Town05_Opt。
+  root: dataset_v2
 
   save_rgb: true
   save_lidar: true

@@ -4,6 +4,7 @@
 
 # Generated datasets
 /dataset/
+/dataset_v2/
 
 # CARLA Python API
 /PythonAPI/
