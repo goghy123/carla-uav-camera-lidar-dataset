@@ -5,6 +5,7 @@ import math
 import queue
 import random
 import time
+import shutil
 from collections import defaultdict
 from pathlib import Path
 
@@ -12,11 +13,12 @@ import numpy as np
 from ruamel.yaml import YAML
 
 from uav_motion import (
+    build_motion_plan,
+    build_attitude_schedule,
+    scene_index,
     altitude_above_road_at_distance,
-    is_hovering_at_frame as profile_is_hovering_at_frame,
-    motion_intervals_at_frame,
-    required_frames as profile_required_frames,
 )
+from recording_options import parse_args, run_directory
 
 try:
     import cv2
@@ -415,20 +417,9 @@ def sensor_world_transform(
 
     world_location = uav_transform.transform(relative_location)
 
-    world_rotation = carla.Rotation(
-        pitch=(
-            uav_transform.rotation.pitch
-            + float(sensor_rotation["pitch"])
-        ),
-        yaw=(
-            uav_transform.rotation.yaw
-            + float(sensor_rotation["yaw"])
-        ),
-        roll=(
-            uav_transform.rotation.roll
-            + float(sensor_rotation["roll"])
-        ),
-    )
+    relative = carla.Transform(relative_location, carla.Rotation(**sensor_rotation))
+    composed = matrix(uav_transform) @ matrix(relative)
+    world_rotation = carla.Rotation(**matrix_to_carla_rotation(composed))
 
     return carla.Transform(world_location, world_rotation)
 
@@ -643,6 +634,14 @@ class UAVRoute:
                 "scripts/route_editor.py and inspect the route."
             )
 
+        self.motion_plan = build_motion_plan(
+            self.total_length, self.fps, uav_config["speed_profile"], hover_config,
+            int(uav_config.get("plan_num_frames", -1)),
+        )
+        self.attitude_schedule = build_attitude_schedule(
+            len(self.motion_plan), self.fps, uav_config["disturbance"]
+        )
+
     @staticmethod
     def _map_short_name(world_map):
         return str(world_map.name).replace("\\", "/").split("/")[-1]
@@ -665,66 +664,30 @@ class UAVRoute:
             )
 
     def required_frames(self):
-        return profile_required_frames(
-            self.total_length,
-            self.distance_per_frame,
-            self.move_frames,
-            self.hover_frames,
-        )
+        return len(self.motion_plan)
 
     def hover_count(self):
-        movement_intervals = math.ceil(
-            self.total_length / self.distance_per_frame
-        )
-        return max(0, movement_intervals - 1) // self.move_frames
+        return len({r["hover_index"] for r in self.motion_plan if r["hover_index"] is not None})
 
     def estimated_duration(self):
         return (self.required_frames() - 1) / self.fps
 
     def distance_at_frame(self, frame_index):
-        movement_intervals = motion_intervals_at_frame(
-            frame_index,
-            self.move_frames,
-            self.hover_frames,
-        )
-        return min(
-            float(movement_intervals) * self.distance_per_frame,
-            self.total_length,
-        )
+        return self.motion_plan[frame_index]["route_distance_m"]
 
     def motion_time_at_frame(self, frame_index):
-        return (
-            motion_intervals_at_frame(
-                frame_index,
-                self.move_frames,
-                self.hover_frames,
-            )
-            / self.fps
-        )
+        return self.motion_plan[frame_index]["motion_time_s"]
 
     def is_hovering_at_frame(self, frame_index):
-        return (
-            not self.is_finished(frame_index)
-            and profile_is_hovering_at_frame(
-                frame_index,
-                self.move_frames,
-                self.hover_frames,
-            )
-        )
+        return self.motion_plan[frame_index]["is_hovering"]
 
     def hover_index_at_frame(self, frame_index):
-        if not self.is_hovering_at_frame(frame_index):
-            return None
-        cycle_frames = self.move_frames + self.hover_frames
-        return int(frame_index) // cycle_frames + 1
+        return self.motion_plan[frame_index]["hover_index"]
 
-    def altitude_at_distance(self, distance):
+    def altitude_at_frame(self, frame_index):
         return altitude_above_road_at_distance(
-            distance,
-            self.speed,
-            self.altitude_min_m,
-            self.altitude_max_m,
-            self.altitude_cycle_motion_seconds,
+            self.motion_time_at_frame(frame_index), 1.0, self.altitude_min_m,
+            self.altitude_max_m, self.altitude_cycle_motion_seconds,
         )
 
     def is_finished(self, frame_index):
@@ -821,27 +784,16 @@ class UAVRoute:
         )
 
     def pose_at_frame(self, frame_index):
-        return self.pose_at_distance(
-            self.distance_at_frame(frame_index)
+        distance = self.distance_at_frame(frame_index)
+        point = self.road_point_at_distance(distance)
+        attitude = self.attitude_schedule["frames"][frame_index]
+        base = carla.Transform(
+            carla.Location(x=float(point[0]), y=float(point[1]),
+                           z=float(point[2] + self.altitude_at_frame(frame_index))),
+            carla.Rotation(yaw=self.yaw_at_distance(distance)),
         )
-
-    def pose_at_distance(self, distance):
-        road_position = self.road_point_at_distance(distance)
-        yaw = self.yaw_at_distance(distance)
-        altitude_m = self.altitude_at_distance(distance)
-
-        return carla.Transform(
-            carla.Location(
-                x=float(road_position[0]),
-                y=float(road_position[1]),
-                z=float(road_position[2] + altitude_m),
-            ),
-            carla.Rotation(
-                pitch=0.0,
-                yaw=float(yaw),
-                roll=0.0,
-            ),
-        )
+        return sensor_world_transform(base, dict(x=0.0, y=0.0, z=0.0),
+                                      dict(pitch=attitude["pitch_deg"], roll=attitude["roll_deg"], yaw=attitude["yaw_deg"]))
 
 
 ########################## 录制计划：决定录制帧数和结束条件 ################################
@@ -891,21 +843,20 @@ def print_recording_plan(
         f"{route.actual_hover_after_motion_seconds:.3f} moving s for "
         f"{route.actual_hover_duration_seconds:.3f} s"
     )
-    print(f"Full-route hovers      : {route.hover_count()}")
+    print(f"Planned hovers         : {route.hover_count()}")
     print(f"Planner resolution     : {route.planner_resolution_m:.3f} m")
     print(f"Max stored XY segment  : {route.max_segment_length_m:.3f} m")
     print(f"Heading lookahead      : {route.heading_lookahead_m:.3f} m")
-    print(f"UAV XY speed           : {route.speed:.3f} m/s")
+    print(f"Scheduled speed range  : {min(r['speed_mps'] for r in route.motion_plan):.3f} .. {max(r['speed_mps'] for r in route.motion_plan):.3f} m/s")
     print(f"Dataset FPS            : {fps:.3f} Hz")
     print(
-        f"XY distance / frame    : "
-        f"{route.distance_per_frame:.3f} m"
+        f"Disturbance events     : {len(route.attitude_schedule['events'])}"
     )
     print(
-        f"Estimated total time   : "
+        f"Planned duration       : "
         f"{route.estimated_duration():.3f} s"
     )
-    print(f"Full-route frames      : {route.required_frames()}")
+    print(f"Planned frames         : {route.required_frames()}")
 
     recording_mode = (
         "UNTIL_ROUTE_END"
@@ -3636,8 +3587,20 @@ def prepare_world_for_route(
 
 ########################## 程序入口：读取配置并启动工具 ################################
 
-def main(route_file_override=None):
-    config = load_config(route_file_override)
+def main(route_file_override=None, options=None):
+    options = options or parse_args([])
+    config = load_config(route_file_override or options.route_file)
+    options.weather = options.weather or config["weather"]["preset"]
+    if options.weather not in config["weather"]["presets"]:
+        raise ValueError("Unknown weather preset")
+    if options.output_root is not None:
+        config["output"]["root"] = options.output_root
+    if options.disturbance is not None:
+        config["uav"]["disturbance"]["enabled"] = options.disturbance
+    if options.num_frames is not None:
+        config["recording"]["num_frames"] = options.num_frames
+    config["weather"]["preset"] = options.weather
+    config["uav"]["plan_num_frames"] = int(config["recording"]["num_frames"])
     validate_config(config)
 
     sim_cfg = config["simulation"]
@@ -3678,6 +3641,25 @@ def main(route_file_override=None):
         lidar_cfg,
     )
 
+    output_root = (PROJECT_ROOT / str(output_cfg["root"])).resolve()
+    scene_dir = run_directory(output_root, route.map_name, options.weather, options.run_id)
+    if scene_dir.exists() and (not scene_dir.is_dir() or any(scene_dir.iterdir())):
+        raise FileExistsError(f"Refusing to mix recordings in nonempty directory: {scene_dir}")
+    scene_dir.mkdir(parents=True, exist_ok=True)
+    run_key = scene_dir.relative_to(output_root).as_posix()
+    print(f"Output: {scene_dir}")
+    print(f"Disturbance: {uav_cfg['disturbance']['enabled']}")
+    for name, data in (("motion_plan.json", {"fps": FPS, "frames": route.motion_plan}),
+                       ("attitude_schedule.json", route.attitude_schedule),
+                       ("scenes.json", scene_index(route.motion_plan, FPS))):
+        (scene_dir / name).write_text(json.dumps(data, indent=2, allow_nan=False), encoding="utf-8")
+    shutil.copyfile(uav_cfg["route_source"], scene_dir / "route.yaml")
+    with (scene_dir / "config.yaml").open("w", encoding="utf-8") as stream:
+        YAML().dump(config, stream)
+    if options.plan_only:
+        print("Plans saved; no CARLA connection made. Use a different output root for recording.")
+        return
+
     client = carla.Client(
         "localhost",
         2000,
@@ -3694,6 +3676,7 @@ def main(route_file_override=None):
         auto_load_route_map=AUTO_LOAD_ROUTE_MAP,
     )
     original_settings = world.get_settings()
+    original_weather = world.get_weather()
 
     server_version = client.get_server_version()
     client_version = client.get_client_version()
@@ -3735,7 +3718,7 @@ def main(route_file_override=None):
         / str(output_cfg["root"])
     )
 
-    scene_name = route.name
+    scene_name = run_key
 
     scene_dir = output_root / scene_name
     rgb_dir = scene_dir / "rgb"
@@ -3743,12 +3726,6 @@ def main(route_file_override=None):
     pose_dir = scene_dir / "pose"
     labels_dir = scene_dir / "labels"
     debug_dir = scene_dir / "debug_bbox"
-
-    if scene_dir.exists() and any(scene_dir.iterdir()):
-        raise FileExistsError(
-            "Dataset scene directory is not empty; refusing to mix recordings:\n"
-            f"{scene_dir}"
-        )
 
     scene_dir.mkdir(
         parents=True,
@@ -3826,6 +3803,15 @@ def main(route_file_override=None):
     try:
         ########################## 同步模式：让模拟器和传感器按同一帧运行 ################################
 
+        weather_values = dict(config["weather"]["presets"][options.weather])
+        world.set_weather(carla.WeatherParameters(**weather_values))
+        applied_weather = world.get_weather()
+        weather_values = {key: float(getattr(applied_weather, key)) for key in (
+            "cloudiness", "precipitation", "precipitation_deposits", "wetness",
+            "wind_intensity", "sun_altitude_angle", "sun_azimuth_angle", "fog_density",
+            "fog_distance", "fog_falloff", "scattering_intensity", "mie_scattering_scale",
+            "rayleigh_scattering_scale", "dust_storm")}
+
         settings = world.get_settings()
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 1.0 / FPS
@@ -3862,6 +3848,10 @@ def main(route_file_override=None):
             random_seed=RANDOM_SEED,
             allowed_classes=allowed_classes,
         )
+        for vehicle in vehicles:
+            traffic_manager.update_vehicle_lights(vehicle, True)
+            if options.weather in ("night", "dawn"):
+                vehicle.set_light_state(carla.VehicleLightState.Position | carla.VehicleLightState.LowBeam)
 
         if (
             traffic_cfg.get(
@@ -4121,10 +4111,14 @@ def main(route_file_override=None):
                 route.actual_hover_duration_seconds
             ),
             "events_before_route_end": int(route.hover_count()),
-            "position_altitude_heading_frozen": True,
+            "nominal_position_and_altitude_frozen": True,
+            "attitude_schedule_continues": True,
         }
 
         calibration = {
+            "format_version": 3,
+            "run_key": run_key,
+            "sensor_mounting": "rigid; world_from_sensor = world_from_uav @ uav_from_sensor",
             "carla_client_version": client_version,
             "carla_server_version": server_version,
             "dataset_fps_hz": float(FPS),
@@ -4216,6 +4210,15 @@ def main(route_file_override=None):
         ########################## 元数据：记录场景、传感器和录制设置 ################################
 
         metadata = {
+            "format_version": 3,
+            "run_key": run_key,
+            "run_id": options.run_id,
+            "weather": options.weather,
+            "weather_parameters": weather_values,
+            "disturbance": dict(uav_cfg["disturbance"]),
+            "speed_profile": dict(uav_cfg["speed_profile"]),
+            "hover_profile": dict(uav_cfg["hover"]),
+            "recording_complete": False,
             "scene_name": scene_name,
             "collector_version": "uav_v3.4",
             "carla_client_version": client_version,
@@ -4516,9 +4519,7 @@ def main(route_file_override=None):
             motion_time = route.motion_time_at_frame(i)
             is_hovering = route.is_hovering_at_frame(i)
             hover_index = route.hover_index_at_frame(i)
-            altitude_above_road = route.altitude_at_distance(
-                route_distance
-            )
+            altitude_above_road = route.altitude_at_frame(i)
 
             route_progress = (
                 route_distance / route.total_length
@@ -4708,6 +4709,16 @@ def main(route_file_override=None):
             dataset_time = float(i) / FPS
 
             frame_info = {
+                "run_key": run_key,
+                "run_id": options.run_id,
+                "weather": options.weather,
+                "scene_id": "scene_%04d" % (i // round(20 * FPS)),
+                "base_yaw_deg": route.yaw_at_distance(route_distance),
+                "attitude_disturbance": route.attitude_schedule["frames"][i],
+                "motion_state": route.motion_plan[i]["motion_state"],
+                "speed_stage": route.motion_plan[i]["speed_stage"],
+                "cruise_time_s": route.motion_plan[i]["cruise_time_s"],
+                "uav_acceleration_mps2": route.motion_plan[i]["acceleration_mps2"],
                 "sample_index": int(i),
                 "dataset_time_s": float(
                     dataset_time
@@ -4723,7 +4734,7 @@ def main(route_file_override=None):
                     route.speed
                 ),
                 "uav_effective_speed_mps": float(
-                    0.0 if is_hovering else route.speed
+                    route.motion_plan[i]["speed_mps"]
                 ),
                 "motion_time_s": float(motion_time),
                 "is_hovering": bool(is_hovering),
@@ -4827,6 +4838,9 @@ def main(route_file_override=None):
 
         ########################## 完成：输出本次录制的结果摘要 ################################
 
+        metadata["recording_complete"] = True
+        (scene_dir / "metadata.json").write_text(json.dumps(metadata, indent=4), encoding="utf-8")
+
         print()
         print("=" * 64)
         print("RECORDING DONE")
@@ -4921,6 +4935,10 @@ def main(route_file_override=None):
                 pass
 
         try:
+            world.set_weather(original_weather)
+        except RuntimeError:
+            pass
+        try:
             world.apply_settings(
                 original_settings
             )
@@ -4931,4 +4949,4 @@ def main(route_file_override=None):
 
 
 if __name__ == "__main__":
-    main()
+    main(options=parse_args())

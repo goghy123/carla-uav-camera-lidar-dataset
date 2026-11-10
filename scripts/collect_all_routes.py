@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from ruamel.yaml import YAML
+from recording_options import parse_args, run_directory, WEATHERS
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -52,11 +53,26 @@ def nonempty_scene_dirs(output_root, entries):
     ]
 
 
-def main():
+def main(argv=None):
+    options = parse_args(argv, batch=True)
     config = load_yaml(CONFIG_PATH)
     entries = discover_routes()
-    output_root = (PROJECT_ROOT / str(config["output"]["root"])).resolve()
-    conflicts = nonempty_scene_dirs(output_root, entries)
+    if options.route_file:
+        path = (CONFIG_DIR / options.route_file).resolve()
+        route = load_yaml(path)["route"]
+        entries = [{"name": route["name"], "route_file": str(path)}]
+    output_root = (PROJECT_ROOT / str(options.output_root or config["output"]["root"])).resolve()
+    weathers = WEATHERS if options.weather == "all" else (options.weather,)
+    jobs, targets = [], set()
+    for entry in entries:
+        route = load_yaml(CONFIG_DIR / entry["route_file"])["route"]
+        for weather in weathers:
+            target = run_directory(output_root, route["map"], weather, options.run_id)
+            if target in targets:
+                raise ValueError(f"Multiple routes target {target}; record route versions under different run IDs")
+            targets.add(target)
+            jobs.append((entry, weather, target))
+    conflicts = [path for path in targets if path.exists() and (not path.is_dir() or any(path.iterdir()))]
 
     if conflicts:
         raise FileExistsError(
@@ -66,19 +82,20 @@ def main():
 
     print("\nOne-click UAV dataset recording")
     print("Output root:", output_root)
-    print("Routes:", len(entries))
+    print("Runs:", len(jobs))
     for index, entry in enumerate(entries, start=1):
         print(f"  [{index:02d}] {entry['name']}")
 
     from collect_uavdataset import main as collect_route
 
-    for index, entry in enumerate(entries, start=1):
+    for index, (entry, weather, target) in enumerate(jobs, start=1):
         print("\n" + "#" * 72)
-        print(f"ROUTE {index}/{len(entries)}: {entry['name']}")
+        print(f"RUN {index}/{len(jobs)}: {entry['name']} / {weather}")
         print("#" * 72)
-        collect_route(route_file_override=entry["route_file"])
+        options.weather = weather
+        collect_route(route_file_override=entry["route_file"], options=options)
 
-    print("\nAll routes recorded successfully:")
+    print("\nAll recording plans saved:" if options.plan_only else "\nAll routes recorded successfully:")
     print(output_root)
 
 

@@ -1,5 +1,7 @@
 # CARLA UAV Camera–LiDAR Dataset
 
+**Dataset v3 已加入五种天气、变速与平滑悬停、可开关的预定姿态扰动、run/scene 索引和 BEVFusion 适配。当前命令与格式以 [Dataset v3 使用说明](DATASET_V3.md) 为准；下方 v2 操作示例保留作历史参考。**
+
 |![demo](assets/demo1.gif)|![demo](assets/demo2.gif)|
 | --- | --- |
 |![demo](assets/demo3.gif)|![demo](assets/demo4.gif)|

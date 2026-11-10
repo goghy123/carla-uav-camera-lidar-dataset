@@ -8,6 +8,16 @@ simulation:
   # false：保留旧的严格检查行为，地图不一致时直接报错退出。
   auto_load_route_map: true
 
+# Fixed for a complete run; CLI --weather overrides this selection.
+weather:
+  preset: clear
+  presets:
+    clear: {cloudiness: 10.0, sun_altitude_angle: 60.0, precipitation: 0.0, wetness: 0.0}
+    overcast: {cloudiness: 90.0, sun_altitude_angle: 60.0, precipitation: 0.0, wetness: 0.0}
+    night: {cloudiness: 10.0, sun_altitude_angle: -30.0, precipitation: 0.0, wetness: 0.0}
+    dawn: {cloudiness: 20.0, sun_altitude_angle: 5.0, precipitation: 0.0, wetness: 0.0}
+    rain: {cloudiness: 90.0, sun_altitude_angle: 45.0, precipitation: 50.0, precipitation_deposits: 40.0, wetness: 80.0}
+
 
 ########################## 录制：统一采样频率，并设置录制帧数 ################################
 
@@ -42,8 +52,22 @@ traffic:
 ########################## UAV 设置：定义飞行参数和当前录制路线 ################################
 
 uav:
-  # 水平（XY）巡航速度。道路高程变化只影响 UAV 的 z，不改变 XY 速度定义。
+  # 旧版兼容的名义速度；v3 实际速度由 speed_profile 与 hover 控制。
   speed_mps: 8.0
+  speed_profile:
+    low_mps: 4.0
+    high_mps: 12.0
+    stage_seconds: 20.0
+
+  disturbance:
+    enabled: true
+    seed: 42
+    probability_per_second: 0.05
+    duration_seconds: [3.0, 6.0]
+    min_gap_seconds: 2.0
+    roll_deg: 2.0
+    pitch_deg: 2.0
+    yaw_deg: 3.0
 
   # UAV 相对 planned_path 道路原始 z 做平滑余弦高度变化。
   # 周期只累计实际前进时间；悬停期间高度相位冻结。
@@ -52,10 +76,12 @@ uav:
     max_above_road_m: 50.0
     cycle_motion_seconds: 80.0
 
-  # 每累计前进 30 s 悬停 3 s；悬停时位置、高度和航向保持不变。
+  # 主巡航累计 30 s 后停车、净悬停 3 s、恢复；扰动计划在悬停时继续执行。
   hover:
     after_motion_seconds: 30.0
     duration_seconds: 3.0
+    brake_seconds: 3.0
+    recover_seconds: 3.0
 
   # collector 使用最终路线前方指定距离的位置计算 yaw，使转弯朝向更平滑。
   heading_lookahead_m: 5.0
@@ -215,8 +241,8 @@ annotations:
 ########################## 输出：说明数据集目录和生成文件 ################################
 
 output:
-  # 新版本按 route.name 写入独立目录，例如 dataset_v2/Town05_Opt。
-  root: dataset_v2
+  # v3: <root>/<route.map>_<weather>/<run_id>/；CLI --output-root 可覆盖。
+  root: dataset_v3
 
   save_rgb: true
   save_lidar: true

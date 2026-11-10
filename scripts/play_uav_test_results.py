@@ -204,7 +204,8 @@ def resolve_test_frames(scene_dir, pred_dir):
     if not manifest_path.exists():
         raise FileNotFoundError("未找到预测清单 manifest.json: {}".format(manifest_path))
     manifest = load_json(manifest_path)
-    scene_name = scene_dir.name
+    metadata_path = scene_dir / "metadata.json"
+    scene_name = load_json(metadata_path).get("run_key", scene_dir.name)
     matching = [s for s in manifest.get("samples", []) if str(s.get("scene_name")) == scene_name]
     if not matching:
         available = sorted({str(s.get("scene_name")) for s in manifest.get("samples", [])})
@@ -251,8 +252,10 @@ def reference_height_m(pose, fallback_altitude_m):
     return lidar_z - route_ground_z
 
 
-def reference_corners_to_raw_lidar(corners_reference, height_m):
+def reference_corners_to_raw_lidar(corners_reference, height_m, raw_from_reference=None):
     corners = np.asarray(corners_reference, dtype=np.float64).reshape(8, 3).copy()
+    if raw_from_reference is not None:
+        return transform_points(corners, np.asarray(raw_from_reference, dtype=np.float64))
     corners[:, 1] *= -1.0
     corners[:, 2] -= float(height_m)
     return corners
@@ -537,7 +540,7 @@ def build_pred_overlays(prediction_data, height_m, K, T_camera_cv_from_lidar, wi
         corners_ref = det.get("corners_3d_reference")
         if corners_ref is None:
             continue
-        corners_lidar = reference_corners_to_raw_lidar(corners_ref, height_m)
+        corners_lidar = reference_corners_to_raw_lidar(corners_ref, height_m, prediction_data.get("raw_lidar_from_reference"))
         corners_cv = transform_points(corners_lidar, T_camera_cv_from_lidar)
         rgb_segments = projected_cuboid_segments(corners_cv, K, width, height, edges=MMDET_BBOX_EDGES)
         box2d_segments = projected_bbox_from_segments(rgb_segments, width, height)
