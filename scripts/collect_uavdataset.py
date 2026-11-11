@@ -3851,8 +3851,7 @@ def main(route_file_override=None, options=None):
         for vehicle in vehicles:
             traffic_manager.update_vehicle_lights(vehicle, True)
             if options.weather in ("night", "dawn"):
-                vehicle.set_light_state(carla.VehicleLightState.Position | carla.VehicleLightState.LowBeam)
-
+                vehicle.set_light_state(carla.VehicleLightState(carla.VehicleLightState.Position | carla.VehicleLightState.LowBeam))
         if (
             traffic_cfg.get(
                 "num_pedestrians",

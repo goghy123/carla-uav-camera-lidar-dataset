@@ -38,7 +38,7 @@ python scripts/collect_all_routes.py --route-file routes/Town05_Opt.yaml --weath
 八张地图 × 五种环境，正式录制共 40 个 run：
 
 ```powershell
-python scripts/collect_all_routes.py --weather all --run-id run_0001 --disturbance --output-root "D:\UAVDatasets\dataset_v3"
+python scripts/collect_all_routes.py --weather all --run-id run_0001 --no-disturbance --output-root dataset_v3
 ```
 
 关闭全部扰动时把 `--disturbance` 替换为 `--no-disturbance`。天气可选 `clear`、`overcast`、`night`、`dawn`、`rain`；`all` 仅用于批量入口。`--num-frames -1` 为完整路线，也是当前配置默认值。
